@@ -31,9 +31,10 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { PartyPopper, RotateCcw, Shuffle } from "lucide-react";
+import { Layers3, PartyPopper, RotateCcw, Shuffle } from "lucide-react";
 import { toast } from "sonner";
 
 import AiPlayPanel from "@/components/AiPlayPanel";
@@ -858,6 +859,12 @@ export default function RubiksCubeCanvas() {
           </div>
 
           <div className="pointer-events-auto flex items-center gap-1.5 sm:gap-2">
+            <Link
+              href="/clover-pyramid"
+              className="hidden h-9 items-center gap-1.5 rounded-md border border-white/15 bg-white/10 px-3 text-xs font-medium text-white/85 backdrop-blur-md transition-colors hover:bg-white/20 sm:flex sm:h-10"
+            >
+              <Layers3 className="size-4" /> Clover Pyramid
+            </Link>
             <div
               aria-live="polite"
               className="shrink-0 whitespace-nowrap rounded-full border border-white/10 bg-black/45 px-3 py-2 text-xs font-medium text-white/85 backdrop-blur-md"
