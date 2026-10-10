@@ -45,17 +45,80 @@ export function diskLetter(disk: number): string {
 /** Compact token for one move, e.g. "A", "B'", "C2", "D3'". */
 export function cloverMoveToken(move: CloverMove): string {
   const magnitude = Math.abs(move.steps);
-  const suffix = `${magnitude > 1 ? magnitude : ""}${move.steps < 0 ? "'" : ""}`;
-  return `${diskLetter(move.disk)}${numberPart(move.steps)}${primePart(move.steps)}`;
+  const number = magnitude > 1 ? String(magnitude) : "";
+  return `${diskLetter(move.disk)}${number}${move.steps < 0 ? "'" : ""}`;
 }
 
-function numberPart(steps: number): string {
-  const magnitude = Math.abs(steps);
-  return magnitude > 1 ? String(magnitude) : "";
+/** Pull the optional `STATE_AFTER: <18 chars>` prediction out of a reply. */
+export function extractCloverPrediction(text: string): string | undefined {
+  const match = /STATE_AFTER\s*[:=]\s*([0-3e?]{18})/i.exec(text);
+  return match ? match[1].toLowerCase() : undefined;
 }
 
-function primePart(steps: number): string {
-  return steps < 0 ? "'" : "";
+/**
+ * Isolate the move payload: everything after a `MOVES:` marker (to the end of
+ * that line) when present, otherwise the whole text. Parsing only the marker
+ * keeps prose from leaking into the move list.
+ */
+function moveSection(text: string): string {
+  const marker = /MOVES\s*[:=]\s*([^\n\r]*)/i.exec(text);
+  return marker ? marker[1] : text;
+}
+
+export interface ParsedCloverSequence {
+  moves: CloverMove[];
+  tokens: string[];
+  /** Unrecognised word-ish tokens found in the move section. */
+  ignored: string[];
+}
+
+/**
+ * Parse disk turns out of a pasted AI reply. Only standalone `A`, `B2`, `C'`,
+ * `D3'`-style tokens count, and each must be bounded by a non-letter on both
+ * sides so ordinary words (e.g. "A good move") are not misread as turns.
+ */
+export function parseCloverMoveSequence(text: string): ParsedCloverSequence {
+  const section = moveSection(text);
+  const letters = DISK_LABELS.join("");
+  const re = new RegExp(`(?:^|[^A-Za-z0-9])([${letters}][1-3]?['\\u2032]?)(?![A-Za-z0-9])`, "g");
+
+  const moves: CloverMove[] = [];
+  const tokens: string[] = [];
+  for (const match of section.matchAll(re)) {
+    const token = match[1];
+    const parsed = parseCloverToken(token);
+    if (parsed) {
+      moves.push(parsed);
+      tokens.push(cloverMoveToken(parsed));
+    }
+  }
+
+  // Surface anything that looked like it wanted to be a move but was not.
+  const stripped = section.replace(re, " ");
+  const ignored = (stripped.match(/[A-Za-z][A-Za-z']*/g) ?? []).filter(
+    (word) => word.length > 1,
+  );
+
+  return { moves, tokens, ignored: ignored.slice(0, 8) };
+}
+
+function parseCloverToken(token: string): CloverMove | null {
+  const match = /^([A-Da-d])([1-3])?(['\u2032]?)$/.exec(token);
+  if (!match) return null;
+  const disk = DISK_LABELS.indexOf(
+    match[1].toUpperCase() as (typeof DISK_LABELS)[number],
+  );
+  if (disk < 0) return null;
+  const magnitude = match[2] ? Number(match[2]) : 1;
+  const negative = match[3] === "'" || match[3] === "\u2032";
+  return { disk, steps: negative ? -magnitude : magnitude };
+}
+
+/** Human token with degrees, e.g. "B −120°". */
+export function cloverMoveLabel(move: CloverMove): string {
+  const deg = Math.round((move.steps * DETENT * 180) / Math.PI);
+  const sign = deg < 0 ? "\u2212" : "+";
+  return `${diskLetter(move.disk)} ${sign}${Math.abs(deg)}\u00b0`;
 }
 
 /** Build the full remote-play prompt with the live state at the end. */

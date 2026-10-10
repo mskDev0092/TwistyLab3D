@@ -12,6 +12,6 @@ Allow: /
 #   - Programmatic access (no UI needed): window.RubiksCubeAPI
 #         getFacelets() getState() getPrompt() applyMoves("R U R'")
 #         applyFacelets("<54 chars>") scramble() reset() isSolved() help()
-#   - Deep-link a cube position:  /#state=<54-char facelet string>
+#   - Deep-link a cube position:  /rubiks-cube#state=<54-char facelet string>
 #   - Machine-readable app card:  /llms.txt
 # ============================================================================

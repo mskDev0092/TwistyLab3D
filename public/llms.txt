@@ -50,5 +50,6 @@ STATE_AFTER: <54-char facelet string predicted after the moves>   (optional)
 
 ## Deep links
 
-Append `#state=<54-char facelet string>` to the URL to boot the cube into
-that position directly (physically unreachable strings are rejected).
+Append `#state=<54-char facelet string>` to the cube page URL
+(`/rubiks-cube`) to boot the cube into that position directly (physically
+unreachable strings are rejected).

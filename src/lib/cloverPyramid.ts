@@ -16,7 +16,7 @@
  *
  *   - 4 corner "clover" disks, one per tetrahedron vertex.
  *   - 12 PETAL pieces, each owned by exactly one corner (3 per corner).
- *   - 12 EDGE pieces, each SHARED by the two corners of its edge (overlap).
+ *   - 6 EDGE pieces, each SHARED by the two corners of its edge (overlap).
  *   - 4 fixed CENTRE pieces that anchor each face.
  *
  * A move rotates every piece in a disk about that vertex's axis by k * 60 deg.
@@ -110,8 +110,17 @@ export const DISK_GRAB_ANGLE = THREE.MathUtils.degToRad(72);
 /** Build a quaternion whose local +Z is `z` and local +Y leans toward `yHint`. */
 function basisQuat(z: THREE.Vector3, yHint: THREE.Vector3): THREE.Quaternion {
   const zAxis = z.clone().normalize();
-  const yAxis = yHint.clone().sub(zAxis.clone().multiplyScalar(yHint.dot(zAxis)));
-  if (yAxis.lengthSq() < 1e-9) yAxis.copy(new THREE.Vector3(0, 1, 0));
+  let yAxis = yHint
+    .clone()
+    .sub(zAxis.clone().multiplyScalar(yHint.dot(zAxis)));
+  if (yAxis.lengthSq() < 1e-9) {
+    // yHint was parallel to z: pick whichever world axis is least aligned with z.
+    const ref =
+      Math.abs(zAxis.x) < 0.9
+        ? new THREE.Vector3(1, 0, 0)
+        : new THREE.Vector3(0, 1, 0);
+    yAxis = ref.clone().sub(zAxis.clone().multiplyScalar(ref.dot(zAxis)));
+  }
   yAxis.normalize();
   const xAxis = new THREE.Vector3().crossVectors(yAxis, zAxis).normalize();
   const matrix = new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis);
@@ -148,11 +157,20 @@ export class CloverPyramidLogic {
   readonly pieces: CloverPiece[] = [];
 
   /** Fixed petal slots, canonical order = face-major, vertex ascending. */
-  readonly petalSlots: Array<{ dir: THREE.Vector3; face: number; vertex: number }> =
-    [];
+  readonly petalSlots: Array<{
+    dir: THREE.Vector3;
+    face: number;
+    vertex: number;
+    quat: THREE.Quaternion;
+  }> = [];
 
   /** Fixed edge slots, one per tetrahedron edge (order = EDGES). */
-  readonly edgeSlots: Array<{ dir: THREE.Vector3; i: number; j: number }> = [];
+  readonly edgeSlots: Array<{
+    dir: THREE.Vector3;
+    i: number;
+    j: number;
+    quat: THREE.Quaternion;
+  }> = [];
 
   /** Snapshot of a live drag so it can be cancelled or snapped. */
   private grabbed: {
@@ -180,7 +198,7 @@ export class CloverPyramidLogic {
         const dir = point.clone().normalize();
         const normal = FACE_NORMALS[j];
         const quat = basisQuat(normal, VERTICES[i]);
-        this.petalSlots.push({ dir: dir.clone(), face: j, vertex: i });
+        this.petalSlots.push({ dir: dir.clone(), face: j, vertex: i, quat });
         this.pieces.push({
           id: id++,
           kind: "petal",
@@ -216,9 +234,11 @@ export class CloverPyramidLogic {
         .clone()
         .add(FACE_NORMALS[adjacentFaces[1]])
         .normalize();
-      const edgeHint = VERTICES[i].clone().add(VERTICES[j]);
+      // The leaf should lie ALONG the edge, so the tangent hint is the edge
+      // line direction (perpendicular to the radial crease normal).
+      const edgeHint = VERTICES[i].clone().sub(VERTICES[j]);
       const quat = basisQuat(normal, edgeHint);
-      this.edgeSlots.push({ dir: dir.clone(), i, j });
+      this.edgeSlots.push({ dir: dir.clone(), i, j, quat });
       this.pieces.push({
         id: id++,
         kind: "edge",
@@ -380,11 +400,38 @@ export class CloverPyramidLogic {
   setTurnAngle(angle: number): void {
     if (!this.grabbed) return;
     const axis = VERTICES[this.grabbed.disk];
-    const q = new THREE.Quaternion().setFromAxisAngle(axis, angle);
+    const qTotal = new THREE.Quaternion().setFromAxisAngle(axis, angle);
+
+    // For the smooth orientation we interpolate between the canonical frames
+    // of the two detent slots the current piece straddles, so a jumbling turn
+    // settles the leaf onto the surface instead of snapping it at the end.
+    const kTotal = angle / DETENT;
+    const k0 = Math.floor(kTotal + 1e-9);
+    const frac = kTotal - k0;
+    const qa = new THREE.Quaternion().setFromAxisAngle(axis, k0 * DETENT);
+    const qb = new THREE.Quaternion().setFromAxisAngle(axis, (k0 + 1) * DETENT);
+
     for (const entry of this.grabbed.snapshot) {
-      entry.piece.dir.copy(entry.dir0).applyQuaternion(q);
-      entry.piece.quat.copy(entry.quat0).premultiply(q);
+      entry.piece.dir.copy(entry.dir0).applyQuaternion(qTotal);
+      const frameA = this.slotQuatFor(entry.dir0.clone().applyQuaternion(qa));
+      const frameB = this.slotQuatFor(entry.dir0.clone().applyQuaternion(qb));
+      if (frameA && frameB) {
+        entry.piece.quat.copy(frameA).slerp(frameB, frac);
+      } else {
+        entry.piece.quat.copy(entry.quat0).premultiply(qTotal);
+      }
     }
+  }
+
+  /** Canonical quaternion of the fixed slot a unit direction lands on. */
+  private slotQuatFor(dir: THREE.Vector3): THREE.Quaternion | null {
+    for (const slot of this.petalSlots) {
+      if (slot.dir.dot(dir) > 0.999) return slot.quat;
+    }
+    for (const slot of this.edgeSlots) {
+      if (slot.dir.dot(dir) > 0.999) return slot.quat;
+    }
+    return null;
   }
 
   /** Finish the grabbed disk at an exact detent count and return the move. */
@@ -393,8 +440,25 @@ export class CloverPyramidLogic {
     const disk = this.grabbed.disk;
     const angle = steps * DETENT;
     this.setTurnAngle(angle);
+    this.snapOrientations();
     this.grabbed = null;
     return { disk, steps };
+  }
+
+  /**
+   * Re-seat every piece's orientation to the canonical frame of the slot it
+   * now occupies. A rigid 60 deg jumbling turn would otherwise leave pieces
+   * tilted ~15.8 deg off the surface; snapping keeps the body perfectly tiled
+   * in every state, so a scrambled pyramid looks as clean as a solved one.
+   */
+  private snapOrientations(): void {
+    for (const piece of this.pieces) {
+      if (piece.kind === "center") continue;
+      const slot =
+        this.petalSlots.find((s) => s.dir.dot(piece.dir) > 0.999) ??
+        this.edgeSlots.find((s) => s.dir.dot(piece.dir) > 0.999);
+      if (slot) piece.quat.copy(slot.quat);
+    }
   }
 
   /** Abort the grabbed disk, restoring the pre-drag state. */

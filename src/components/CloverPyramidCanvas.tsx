@@ -23,7 +23,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { Gamepad2, PartyPopper, RotateCcw, Shuffle } from "lucide-react";
+import { Home, PartyPopper, RotateCcw, Shuffle } from "lucide-react";
 import { toast } from "sonner";
 
 import CloverInfoPanel from "@/components/CloverInfoPanel";
@@ -38,6 +38,10 @@ import {
   generateCloverScramble,
   type CloverMove,
 } from "@/lib/cloverPyramid";
+import {
+  cloverMoveToken,
+  parseCloverMoveSequence,
+} from "@/lib/cloverNotation";
 
 /* ------------------------------- tuning ---------------------------------- */
 
@@ -45,6 +49,7 @@ const CAMERA_FOV = 38;
 const CAMERA_POSITION = new THREE.Vector3(4.8, 4.0, 5.6);
 const SNAP_DURATION_MS = 180;
 const SCRAMBLE_MOVE_MS = 185;
+const RUN_MOVE_MS = 210;
 const SCRAMBLE_MOVES = 22;
 const HISTORY_LIMIT = 60;
 const PIECE_LIFT = 0.015;
@@ -159,6 +164,13 @@ export default function CloverPyramidCanvas() {
   const [busy, setBusy] = useState(false);
   const [solved, setSolved] = useState(true);
   const [history, setHistory] = useState<string[]>([]);
+  const [stateCode, setStateCode] = useState("");
+  const [runProgress, setRunProgress] = useState<{
+    current: number;
+    total: number;
+    token: string;
+  } | null>(null);
+  const [verify, setVerify] = useState<{ match: boolean } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
@@ -169,8 +181,17 @@ export default function CloverPyramidCanvas() {
     setHistory([...list]);
   }, []);
 
-  /** One animated, self-committing disk turn (scramble queue). */
-  const animateMove = useCallback(
+  /** Re-read solved/slot state from the logic into React state. */
+  const refreshState = useCallback((): void => {
+    const logic = logicRef.current;
+    if (!logic) return;
+    setStateCode(logic.getStateCode());
+    setSolved(logic.isSolved());
+    setMoves(movesRef.current);
+  }, []);
+
+  /** One animated, self-committing disk turn. */
+  const playMove = useCallback(
     async (move: CloverMove, duration: number): Promise<void> => {
       const logic = logicRef.current;
       if (!logic || move.disk < 0 || move.steps === 0) return;
@@ -194,22 +215,23 @@ export default function CloverPyramidCanvas() {
     if (!logic || busyRef.current || logic.isGrabbed) return;
     busyRef.current = true;
     setBusy(true);
-    setSolved(false);
+    setVerify(null);
     scrambledRef.current = true;
     movesRef.current = 0;
-    setMoves(0);
     historyRef.current = [];
+    setMoves(0);
     setHistory([]);
 
     const sequence = generateCloverScramble(SCRAMBLE_MOVES);
     for (const move of sequence) {
       appendHistory([CloverPyramidLogic.moveToken(move)]);
-      await animateMove(move, SCRAMBLE_MOVE_MS);
+      await playMove(move, SCRAMBLE_MOVE_MS);
       if (disposedRef.current) return;
     }
     busyRef.current = false;
     setBusy(false);
-  }, [animateMove, appendHistory]);
+    refreshState();
+  }, [appendHistory, playMove, refreshState]);
 
   const handleReset = useCallback(() => {
     const logic = logicRef.current;
@@ -220,8 +242,50 @@ export default function CloverPyramidCanvas() {
     setMoves(0);
     setHistory([]);
     scrambledRef.current = false;
-    setSolved(true);
-  }, []);
+    setVerify(null);
+    refreshState();
+  }, [refreshState]);
+
+  /** Execute an external move sequence (AI paste / window API) with animation. */
+  const runMoves = useCallback(
+    async (sequence: CloverMove[], predictedState?: string): Promise<void> => {
+      const logic = logicRef.current;
+      if (!logic || busyRef.current || logic.isGrabbed || sequence.length === 0) return;
+      busyRef.current = true;
+      setBusy(true);
+      setVerify(null);
+
+      const total = sequence.length;
+      for (let i = 0; i < total; i += 1) {
+        const move = sequence[i];
+        const token = cloverMoveToken(move);
+        setRunProgress({ current: i + 1, total, token });
+        await playMove(move, RUN_MOVE_MS);
+        if (disposedRef.current) return;
+        movesRef.current += Math.abs(move.steps);
+        appendHistory([CloverPyramidLogic.moveToken(move)]);
+      }
+
+      setRunProgress(null);
+      busyRef.current = false;
+      setBusy(false);
+
+      if (disposedRef.current) return;
+      const after = logic.getStateCode();
+      setStateCode(after);
+      const nowSolved = logic.isSolved();
+      setSolved(nowSolved);
+      if (!nowSolved) scrambledRef.current = true;
+      else if (scrambledRef.current) {
+        scrambledRef.current = false;
+        toast.success(`Pyramid solved in ${movesRef.current} turns!`, {
+          description: "Every petal found its face. Scramble again to keep going.",
+        });
+      }
+      if (predictedState) setVerify({ match: predictedState === after });
+    },
+    [appendHistory, playMove],
+  );
 
   useEffect(() => {
     const container = containerRef.current;
@@ -505,6 +569,7 @@ export default function CloverPyramidCanvas() {
         movesRef.current = nextMoves;
         setMoves(nextMoves);
         appendHistory([CloverPyramidLogic.moveToken(move)]);
+        setStateCode(logic.getStateCode());
 
         const nowSolved = logic.isSolved();
         setSolved(nowSolved);
@@ -513,6 +578,8 @@ export default function CloverPyramidCanvas() {
           toast.success(`Pyramid solved in ${nextMoves} moves!`, {
             description: "Every petal found its face. Scramble again to keep going.",
           });
+        } else if (!nowSolved) {
+          scrambledRef.current = true;
         }
       });
     };
@@ -561,6 +628,7 @@ export default function CloverPyramidCanvas() {
     frameId = requestAnimationFrame(tick);
     requestAnimationFrame(() => {
       setReady(true);
+      setStateCode(logic.getStateCode());
       setSolved(logic.isSolved());
     });
 
@@ -594,6 +662,37 @@ export default function CloverPyramidCanvas() {
       dragRef.current = null;
     };
   }, [appendHistory]);
+
+  /* --------------------- bot / agent window API --------------------- */
+  useEffect(() => {
+    const api = {
+      getState: () => logicRef.current?.getStateCode() ?? "",
+      isSolved: () => logicRef.current?.isSolved() ?? true,
+      getMoves: () => movesRef.current,
+      getHistory: () => historyRef.current.slice(),
+      scramble: () => handleScramble(),
+      reset: () => handleReset(),
+      applyMoves: (tokens: string | string[]) => {
+        const text = Array.isArray(tokens) ? `MOVES: ${tokens.join(" ")}` : tokens;
+        const parsed = parseCloverMoveSequence(text);
+        void runMoves(parsed.moves);
+        return { parsed: parsed.tokens, ignored: parsed.ignored };
+      },
+      help: () =>
+        [
+          "Clover Pyramid remote-play API",
+          "  getState()            -> 18-char slot code (petals face-major, then edges)",
+          "  isSolved() / getMoves() / getHistory()",
+          "  scramble() / reset()",
+          "  applyMoves(\"A B' C2\")  -> runs the tokens on the real puzzle",
+          "Notation: X = 60deg, X' = -60deg, X2 = 120deg, X3 = 180deg; X in A B C D.",
+        ].join("\n"),
+    };
+    (window as unknown as Record<string, unknown>).CloverPyramidAPI = api;
+    return () => {
+      delete (window as unknown as Record<string, unknown>).CloverPyramidAPI;
+    };
+  }, [handleScramble, handleReset, runMoves]);
 
   /* --------------------------- HUD ---------------------------- */
   return (
@@ -630,9 +729,11 @@ export default function CloverPyramidCanvas() {
           <div className="pointer-events-auto flex items-center gap-1.5 sm:gap-2">
             <Link
               href="/"
-              className="hidden h-9 items-center gap-1.5 rounded-md border border-white/15 bg-white/10 px-3 text-xs font-medium text-white/85 backdrop-blur-md transition-colors hover:bg-white/20 sm:flex sm:h-10"
+              aria-label="Back to all puzzles"
+              className="flex h-9 items-center gap-1.5 rounded-md border border-white/15 bg-white/10 px-3 text-xs font-medium text-white/85 backdrop-blur-md transition-colors hover:bg-white/20 sm:h-10"
             >
-              <Gamepad2 className="size-4" /> Rubik&apos;s Cube
+              <Home className="size-4" />
+              <span className="hidden sm:inline">Home</span>
             </Link>
             <div
               aria-live="polite"
@@ -698,6 +799,10 @@ export default function CloverPyramidCanvas() {
           isSolved={solved}
           busy={busy}
           history={history}
+          stateCode={stateCode}
+          runProgress={runProgress}
+          verify={verify}
+          onRunMoves={runMoves}
         />
       </aside>
 

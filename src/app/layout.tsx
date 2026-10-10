@@ -14,23 +14,32 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "3D Puzzle Arcade — Rubik's Cube & Jumbling Pyramids",
+  title: "Twisty Lab — Rubik's Cube & Clover Pyramid",
   description:
-    "Interactive vanilla Three.js puzzles: an AI-playable Rubik's Cube and the Clover Pyramid jumbling puzzle. Static export, WebGL, mouse and touch.",
-  keywords: ["3D puzzles", "Three.js", "Rubik's Cube", "jumbling puzzle"],
-  authors: [{ name: "3D Puzzle Arcade" }],
+    "Interactive vanilla Three.js twisty puzzles: an AI-playable Rubik's Cube and the Clover Pyramid jumbling tetrahedron. Static export, WebGL, mouse and touch.",
+  keywords: [
+    "Twisty Lab",
+    "3D puzzles",
+    "Three.js",
+    "Rubik's Cube",
+    "Clover Pyramid",
+    "jumbling puzzle",
+  ],
+  authors: [{ name: "Twisty Lab" }],
   icons: {
     icon: "/logo.svg",
   },
   openGraph: {
-    title: "3D Puzzle Arcade",
-    description: "Interactive Three.js puzzles: Rubik's Cube and Jumbling Pyramids",
+    title: "Twisty Lab",
+    description:
+      "Interactive Three.js twisty puzzles: Rubik's Cube and the Clover Pyramid",
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "3D Puzzle Arcade",
-    description: "Interactive Three.js puzzles: Rubik's Cube and Jumbling Pyramids",
+    title: "Twisty Lab",
+    description:
+      "Interactive Three.js twisty puzzles: Rubik's Cube and the Clover Pyramid",
   },
 };
 
