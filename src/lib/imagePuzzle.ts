@@ -2,9 +2,10 @@
  * imagePuzzle
  * ===========
  * Framework-free helpers for the "Photo Jigsaw" 3D puzzle: procedurally
- * generated sample images, cover-crop slicing into square tiles, and a
- * scramble permutation. Kept separate from the Three.js component so the pure
- * logic (slicing maths, scramble validity) can be unit-tested in isolation.
+ * generated sample images, piece layouts for several board shapes (squares,
+ * jigsaw, honeycomb, triangle mosaic), and a scramble permutation. Kept
+ * separate from the Three.js component so the pure logic (layout maths,
+ * scramble validity) can be unit-tested in isolation.
  */
 
 /** A drawable source plus its intrinsic size. */
@@ -27,6 +28,43 @@ export const DIFFICULTIES: GridPreset[] = [
   { label: "5 × 5", hint: "Tricky", cols: 5, rows: 5 },
   { label: "6 × 6", hint: "Tough", cols: 6, rows: 6 },
 ];
+
+/* ------------------------------- shapes ---------------------------------- */
+
+export type PieceShape = "classic" | "jigsaw" | "hexagon" | "triangle";
+
+export interface ShapePreset {
+  id: PieceShape;
+  label: string;
+  hint: string;
+}
+
+export const SHAPES: ShapePreset[] = [
+  { id: "classic", label: "Classic", hint: "Squares" },
+  { id: "jigsaw", label: "Jigsaw", hint: "Knobs" },
+  { id: "hexagon", label: "Honeycomb", hint: "Hexagons" },
+  { id: "triangle", label: "Mosaic", hint: "Triangles" },
+];
+
+/** A 2-D point, framework-free so layouts can be unit-tested without Three.js. */
+export interface Vec2 {
+  x: number;
+  y: number;
+}
+
+/** One piece: its outline (board-space, y up) and its home centroid. */
+export interface PieceCell {
+  center: Vec2;
+  points: Vec2[];
+}
+
+export interface BoardLayout {
+  width: number;
+  height: number;
+  cells: PieceCell[];
+  /** Nearest-cell drop radius: how close a drag must land to snap a swap. */
+  spacing: number;
+}
 
 /* ------------------------------ samples ---------------------------------- */
 
@@ -327,48 +365,314 @@ export function loadImage(src: string): Promise<HTMLImageElement> {
 }
 
 /**
- * Draw `img` cover-cropped into a square `cols*tile × rows*tile` canvas, ready
- * to be sliced into perfectly aligned square tiles (no seams).
+ * Draw `img` cover-cropped into one canvas whose aspect ratio matches the board
+ * (`boardW : boardH`), capped at `maxPx` on the long edge. A single shared
+ * texture keeps every piece's paint aligned no matter what shape it is.
  */
-export function buildMaster(
+export function buildMasterCanvas(
   img: ImageLike,
-  cols: number,
-  rows: number,
-  tile = 160,
+  boardW: number,
+  boardH: number,
+  maxPx = 1024,
 ): HTMLCanvasElement {
-  const w = cols * tile;
-  const h = rows * tile;
+  const aspect = boardW / boardH;
+  const w = aspect >= 1 ? maxPx : Math.round(maxPx * aspect);
+  const h = aspect >= 1 ? Math.round(maxPx / aspect) : maxPx;
   const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
+  canvas.width = Math.max(1, w);
+  canvas.height = Math.max(1, h);
   const ctx = canvas.getContext("2d");
   if (!ctx) return canvas;
   ctx.fillStyle = "#0b0d13";
-  ctx.fillRect(0, 0, w, h);
-  const scale = Math.max(w / img.width, h / img.height);
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const scale = Math.max(canvas.width / img.width, canvas.height / img.height);
   const dw = img.width * scale;
   const dh = img.height * scale;
-  ctx.drawImage(img.source, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  ctx.drawImage(
+    img.source,
+    (canvas.width - dw) / 2,
+    (canvas.height - dh) / 2,
+    dw,
+    dh,
+  );
   return canvas;
 }
 
-/** Extract the (r, c) tile of `master` as its own canvas. */
-export function sliceTile(
-  master: HTMLCanvasElement,
-  c: number,
-  r: number,
+/* ------------------------------ layouts ---------------------------------- */
+
+/** Signed-area centroid; falls back to the vertex mean for degenerate rings. */
+function polygonCentroid(points: Vec2[]): Vec2 {
+  let area = 0;
+  let cx = 0;
+  let cy = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const p = points[i];
+    const q = points[(i + 1) % points.length];
+    const cross = p.x * q.y - q.x * p.y;
+    area += cross;
+    cx += (p.x + q.x) * cross;
+    cy += (p.y + q.y) * cross;
+  }
+  area *= 0.5;
+  if (Math.abs(area) < 1e-9) {
+    const sum = points.reduce((s, p) => ({ x: s.x + p.x, y: s.y + p.y }), {
+      x: 0,
+      y: 0,
+    });
+    return { x: sum.x / points.length, y: sum.y / points.length };
+  }
+  return { x: cx / (6 * area), y: cy / (6 * area) };
+}
+
+/** Force a ring into counter-clockwise order (Three.js front faces +Z). */
+function ensureCCW(points: Vec2[]): Vec2[] {
+  let area = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const p = points[i];
+    const q = points[(i + 1) % points.length];
+    area += p.x * q.y - q.x * p.y;
+  }
+  return area < 0 ? points.slice().reverse() : points;
+}
+
+/** Catmull-Rom through `controls`, sampling `perSegment` steps. */
+function catmullRom(controls: Vec2[], perSegment: number): Vec2[] {
+  if (controls.length < 2) return controls.slice();
+  const out: Vec2[] = [];
+  for (let i = 0; i < controls.length - 1; i += 1) {
+    const p0 = controls[i - 1] ?? controls[i];
+    const p1 = controls[i];
+    const p2 = controls[i + 1];
+    const p3 = controls[i + 2] ?? controls[i + 1];
+    for (let s = 0; s < perSegment; s += 1) {
+      const t = s / perSegment;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      out.push({
+        x:
+          0.5 *
+          (2 * p1.x +
+            (-p0.x + p2.x) * t +
+            (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+            (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        y: 0.5 *
+          (2 * p1.y +
+            (-p0.y + p2.y) * t +
+            (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+            (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3),
+      });
+    }
+  }
+  out.push(controls[controls.length - 1]);
+  return out;
+}
+
+/** Classic square grid: `cols × rows` unit cells. */
+function squareCells(cols: number, rows: number): Vec2[][] {
+  const cells: Vec2[][] = [];
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      cells.push([
+        { x: c, y: r },
+        { x: c + 1, y: r },
+        { x: c + 1, y: r + 1 },
+        { x: c, y: r + 1 },
+      ]);
+    }
+  }
+  return cells;
+}
+
+/** Heading for a jigsaw tab (fraction of edge length). */
+const TAB_CONTROLS: Vec2[] = [
+  { x: 0, y: 0 },
+  { x: 0.18, y: -0.06 },
+  { x: 0.34, y: 0.26 },
+  { x: 0.5, y: 0.3 },
+  { x: 0.66, y: 0.26 },
+  { x: 0.82, y: -0.06 },
+  { x: 1, y: 0 },
+];
+const TAB_SCALE = 0.58;
+
+/**
+ * Jigsaw: square cells whose internal edges carry an interlocking knob. Shared
+ * edges are generated once and cached, so both neighbouring pieces trace the
+ * exact same curve (one reversed) and the picture stays seamless.
+ */
+function jigsawCells(cols: number, rows: number): Vec2[][] {
+  const cache = new Map<string, Vec2[]>();
+
+  const build = (a: Vec2, b: Vec2, internal: boolean, key: string): Vec2[] => {
+    const hit = cache.get(key);
+    if (hit) return hit;
+    let pts: Vec2[];
+    if (!internal) {
+      pts = [a, b];
+    } else {
+      const dir = (a.x + a.y) % 2 === 0 ? 1 : -1;
+      const ex = b.x - a.x;
+      const ey = b.y - a.y;
+      const len = Math.hypot(ex, ey);
+      const nx = -ey / len;
+      const ny = ex / len;
+      pts = catmullRom(TAB_CONTROLS, 5).map((p) => {
+        const off = p.y * TAB_SCALE * dir * len;
+        return { x: a.x + ex * p.x + nx * off, y: a.y + ey * p.x + ny * off };
+      });
+    }
+    cache.set(key, pts);
+    return pts;
+  };
+
+  const reverse = (pts: Vec2[]): Vec2[] => pts.slice().reverse();
+  const cells: Vec2[][] = [];
+
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      const bottom = build({ x: c, y: r }, { x: c + 1, y: r }, r > 0, `h:${c}:${r}`);
+      const right = build(
+        { x: c + 1, y: r },
+        { x: c + 1, y: r + 1 },
+        c < cols - 1,
+        `v:${c + 1}:${r}`,
+      );
+      const top = reverse(
+        build({ x: c, y: r + 1 }, { x: c + 1, y: r + 1 }, r < rows - 1, `h:${c}:${r + 1}`),
+      );
+      const left = reverse(
+        build({ x: c, y: r }, { x: c, y: r + 1 }, c > 0, `v:${c}:${r}`),
+      );
+      const ring: Vec2[] = [];
+      [bottom, right, top, left].forEach((edge, idx) => {
+        for (let k = idx === 0 ? 0 : 1; k < edge.length; k += 1) ring.push(edge[k]);
+      });
+      ring.pop();
+      cells.push(ring);
+    }
+  }
+  return cells;
+}
+
+/** Honeycomb: pointy-top hexagons in offset rows (unit circumradius). */
+function hexagonCells(cols: number, rows: number): Vec2[][] {
+  const S = Math.sqrt(3);
+  const cells: Vec2[][] = [];
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      const cx = (c + 0.5 * (r % 2)) * S;
+      const cy = r * 1.5;
+      const pts: Vec2[] = [];
+      for (let k = 0; k < 6; k += 1) {
+        const a = (Math.PI / 3) * k + Math.PI / 2;
+        pts.push({ x: cx + Math.cos(a), y: cy + Math.sin(a) });
+      }
+      cells.push(pts);
+    }
+  }
+  return cells;
+}
+
+/** Mosaic: equilateral subdivision of a big triangle of side `rows` (rows²). */
+function triangleCells(rows: number): Vec2[][] {
+  const H = Math.sqrt(3) / 2;
+  const cells: Vec2[][] = [];
+  for (let k = 0; k < rows; k += 1) {
+    const y0 = k * H;
+    const y1 = (k + 1) * H;
+    const x0 = -rows / 2 + k * 0.5;
+    const up = rows - k;
+    for (let j = 0; j < up; j += 1) {
+      cells.push([
+        { x: x0 + j, y: y0 },
+        { x: x0 + j + 1, y: y0 },
+        { x: x0 + j + 0.5, y: y1 },
+      ]);
+    }
+    for (let j = 0; j < up - 1; j += 1) {
+      cells.push([
+        { x: x0 + j + 1, y: y0 },
+        { x: x0 + j + 1.5, y: y1 },
+        { x: x0 + j + 0.5, y: y1 },
+      ]);
+    }
+  }
+  return cells;
+}
+
+/** Scale every ring to fit `target`, then measure centroids + drop radius. */
+function finalize(raw: Vec2[][], target: number): BoardLayout {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const pts of raw) {
+    for (const p of pts) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+  }
+  const w = maxX - minX;
+  const h = maxY - minY;
+  const scale = target / Math.max(w, h);
+  const ox = (minX + maxX) / 2;
+  const oy = (minY + maxY) / 2;
+
+  const cells: PieceCell[] = raw.map((pts) => {
+    const points = ensureCCW(
+      pts.map((p) => ({ x: (p.x - ox) * scale, y: (p.y - oy) * scale })),
+    );
+    return { points, center: polygonCentroid(points) };
+  });
+
+  const nn: number[] = [];
+  for (let i = 0; i < cells.length; i += 1) {
+    let best = Infinity;
+    for (let j = 0; j < cells.length; j += 1) {
+      if (i === j) continue;
+      const d = Math.hypot(
+        cells[i].center.x - cells[j].center.x,
+        cells[i].center.y - cells[j].center.y,
+      );
+      if (d < best) best = d;
+    }
+    if (Number.isFinite(best)) nn.push(best);
+  }
+  nn.sort((a, b) => a - b);
+  const median = nn.length ? nn[Math.floor(nn.length / 2)] : target;
+
+  return {
+    width: w * scale,
+    height: h * scale,
+    cells,
+    spacing: median * 0.7,
+  };
+}
+
+/** Build every piece outline for `shape` on a `cols × rows` board. */
+export function buildLayout(
+  shape: PieceShape,
   cols: number,
   rows: number,
-): HTMLCanvasElement {
-  const tw = master.width / cols;
-  const th = master.height / rows;
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.round(tw);
-  canvas.height = Math.round(th);
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return canvas;
-  ctx.drawImage(master, c * tw, r * th, tw, th, 0, 0, canvas.width, canvas.height);
-  return canvas;
+  target = 4,
+): BoardLayout {
+  let raw: Vec2[][];
+  switch (shape) {
+    case "jigsaw":
+      raw = jigsawCells(cols, rows);
+      break;
+    case "hexagon":
+      raw = hexagonCells(cols, rows);
+      break;
+    case "triangle":
+      raw = triangleCells(rows);
+      break;
+    default:
+      raw = squareCells(cols, rows);
+  }
+  return finalize(raw, target);
 }
 
 /** Small cover-cropped square preview data-URL for the reference thumbnail. */

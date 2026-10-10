@@ -4,9 +4,13 @@
  * ImagePuzzleCanvas
  * =================
  * Browser-only Three.js renderer for the "Photo Jigsaw" puzzle: any picture
- * (built-in sample, upload, or dropped file) is sliced into square tiles that
- * start scrambled on a board. Drag one tile onto another (or tap two tiles) to
- * swap them; arrange every tile back into its home slot to solve the picture.
+ * (built-in sample, upload, or dropped file) is cut into interlocking pieces —
+ * squares, jigsaw knobs, hexagons or triangle mosaic — that start scrambled on
+ * a board. All pieces share one board texture whose UVs are derived from each
+ * piece's position, so the picture stays seamless whatever the shape.
+ *
+ * Drag one piece onto another (or tap two pieces) to swap them; arrange every
+ * piece back into its home slot to solve the picture.
  *
  * Loaded through `next/dynamic { ssr: false }` (see ImagePuzzleWrapper), so
  * `window`/`document` always exist. All GPU resources are created in one
@@ -31,20 +35,24 @@ import ImagePuzzlePanel from "@/components/ImagePuzzlePanel";
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import {
-  buildMaster,
+  SHAPES,
+  buildLayout,
+  buildMasterCanvas,
   loadImage,
   makePreview,
   renderSample,
   scrambleOrder,
-  sliceTile,
+  type BoardLayout,
+  type PieceCell,
+  type PieceShape,
   type SampleId,
 } from "@/lib/imagePuzzle";
 
 /* ------------------------------- tuning ---------------------------------- */
 
-const BOARD = 4; // world-units edge length of the square board
-const TILE = 160; // pixels per tile in the master canvas
+const BOARD = 4; // world-units target edge length of the board
 const PIECE_DEPTH = 0.08;
+const MASTER_PX = 1024; // long-edge resolution of the shared board texture
 const DRAG_Z = 0.6;
 const HOVER_Z = 0.08;
 const SELECT_Z = 0.16;
@@ -64,20 +72,11 @@ interface GridDims {
   rows: number;
 }
 
-interface GridMetrics {
-  cols: number;
-  rows: number;
-  pieceW: number;
-  pieceH: number;
-}
-
 interface PieceRef {
   home: number;
   cell: number;
   mesh: THREE.Mesh;
-  geometry: THREE.BoxGeometry;
-  material: THREE.MeshStandardMaterial;
-  texture: THREE.CanvasTexture;
+  geometry: THREE.BufferGeometry;
   target: THREE.Vector3;
 }
 
@@ -109,6 +108,41 @@ function createSampleSource(id: SampleId): SourceImage {
   return { el: canvas, width: canvas.width, height: canvas.height };
 }
 
+/**
+ * Extrude one piece from its board-space outline. UVs are derived from each
+ * vertex's absolute board position so the single shared board texture lines up
+ * perfectly across arbitrary shapes (the caps get the picture, the sides don't).
+ */
+function createPieceGeometry(
+  cell: PieceCell,
+  boardW: number,
+  boardH: number,
+): THREE.BufferGeometry {
+  const shape = new THREE.Shape();
+  cell.points.forEach((p, i) => {
+    const x = p.x - cell.center.x;
+    const y = p.y - cell.center.y;
+    if (i === 0) shape.moveTo(x, y);
+    else shape.lineTo(x, y);
+  });
+  shape.closePath();
+
+  const geometry = new THREE.ExtrudeGeometry(shape, {
+    depth: PIECE_DEPTH,
+    bevelEnabled: false,
+  });
+  const position = geometry.attributes.position;
+  const uv = new Float32Array(position.count * 2);
+  for (let i = 0; i < position.count; i += 1) {
+    const ax = cell.center.x + position.getX(i);
+    const ay = cell.center.y + position.getY(i);
+    uv[i * 2] = (ax + boardW / 2) / boardW;
+    uv[i * 2 + 1] = (ay + boardH / 2) / boardH;
+  }
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+  return geometry;
+}
+
 const previewOf = (src: SourceImage): string =>
   makePreview({ source: src.el, width: src.width, height: src.height }, 256);
 
@@ -116,7 +150,11 @@ export default function ImagePuzzleCanvas() {
   const mountRef = useRef<HTMLDivElement>(null);
   const threeRef = useRef<SceneRefs | null>(null);
   const piecesRef = useRef<PieceRef[]>([]);
-  const gridRef = useRef<GridMetrics | null>(null);
+  const layoutRef = useRef<BoardLayout | null>(null);
+  const assetsRef = useRef<{
+    texture: THREE.Texture;
+    material: THREE.Material;
+  } | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const selectedRef = useRef<PieceRef | null>(null);
   const hoverRef = useRef<PieceRef | null>(null);
@@ -129,6 +167,7 @@ export default function ImagePuzzleCanvas() {
   const [placed, setPlaced] = useState(0);
   const [solved, setSolved] = useState(false);
   const [grid, setGrid] = useState<GridDims>({ cols: 4, rows: 4 });
+  const [shape, setShape] = useState<PieceShape>("classic");
   // Default picture is created lazily (client-only) so no setState runs in an
   // effect just to seed the board.
   const [source, setSource] = useState<SourceImage | null>(() =>
@@ -149,10 +188,13 @@ export default function ImagePuzzleCanvas() {
     for (const piece of piecesRef.current) {
       three.group.remove(piece.mesh);
       piece.geometry.dispose();
-      piece.texture.dispose();
-      piece.material.dispose();
     }
     piecesRef.current = [];
+    if (assetsRef.current) {
+      assetsRef.current.texture.dispose();
+      assetsRef.current.material.dispose();
+      assetsRef.current = null;
+    }
     dragRef.current = null;
     selectedRef.current = null;
     hoverRef.current = null;
@@ -169,22 +211,18 @@ export default function ImagePuzzleCanvas() {
   }, []);
 
   const updateTargets = useCallback(() => {
-    const metrics = gridRef.current;
-    if (!metrics) return;
-    const { cols, rows, pieceW, pieceH } = metrics;
+    const layout = layoutRef.current;
+    if (!layout) return;
     for (const piece of piecesRef.current) {
       if (dragRef.current?.piece === piece) continue;
-      const c = piece.cell % cols;
-      const r = Math.floor(piece.cell / cols);
-      const x = (c - (cols - 1) / 2) * pieceW;
-      const y = ((rows - 1) / 2 - r) * pieceH;
+      const center = layout.cells[piece.cell].center;
       const z =
         selectedRef.current === piece
           ? SELECT_Z
           : hoverRef.current === piece
             ? HOVER_Z
             : 0;
-      piece.target.set(x, y, z);
+      piece.target.set(center.x, center.y, z);
     }
   }, []);
 
@@ -226,65 +264,48 @@ export default function ImagePuzzleCanvas() {
   );
 
   const buildBoard = useCallback(
-    (src: SourceImage, dims: GridDims) => {
+    (src: SourceImage, dims: GridDims, shapeId: PieceShape) => {
       const three = threeRef.current;
       if (!three) return;
       clearBoard();
 
-      const { cols, rows } = dims;
-      const pieceW = BOARD / cols;
-      const pieceH = BOARD / rows;
-      gridRef.current = { cols, rows, pieceW, pieceH };
+      const layout = buildLayout(shapeId, dims.cols, dims.rows, BOARD);
+      layoutRef.current = layout;
 
-      const master = buildMaster(
+      const master = buildMasterCanvas(
         { source: src.el, width: src.width, height: src.height },
-        cols,
-        rows,
-        TILE,
+        layout.width,
+        layout.height,
+        MASTER_PX,
       );
-      const count = cols * rows;
-      const order = scrambleOrder(count);
+      const texture = new THREE.CanvasTexture(master);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.anisotropy = three.maxAniso;
+      const material = new THREE.MeshStandardMaterial({
+        map: texture,
+        roughness: 0.85,
+        metalness: 0,
+      });
+      assetsRef.current = { texture, material };
 
-      for (let home = 0; home < cols * rows; home += 1) {
-        const c = home % cols;
-        const r = Math.floor(home / cols);
-        const texture = new THREE.CanvasTexture(
-          sliceTile(master, c, r, cols, rows),
-        );
-        texture.colorSpace = THREE.SRGBColorSpace;
-        texture.anisotropy = three.maxAniso;
-        const material = new THREE.MeshStandardMaterial({
-          map: texture,
-          roughness: 0.92,
-          metalness: 0,
-        });
-        const geometry = new THREE.BoxGeometry(
-          pieceW * 0.98,
-          pieceH * 0.98,
-          PIECE_DEPTH,
-        );
-        const mesh = new THREE.Mesh(geometry, [
-          three.sideMaterial,
-          three.sideMaterial,
-          three.sideMaterial,
-          three.sideMaterial,
-          material,
-          three.sideMaterial,
-        ]);
+      const order = scrambleOrder(layout.cells.length);
 
-        const cell = order[home];
-        const x = ((cell % cols) - (cols - 1) / 2) * pieceW;
-        const y = ((rows - 1) / 2 - Math.floor(cell / cols)) * pieceH;
-        mesh.position.set(x, y, 0);
+      for (let home = 0; home < layout.cells.length; home += 1) {
+        const geometry = createPieceGeometry(
+          layout.cells[home],
+          layout.width,
+          layout.height,
+        );
+        const mesh = new THREE.Mesh(geometry, [material, three.sideMaterial]);
+        const start = layout.cells[order[home]].center;
+        mesh.position.set(start.x, start.y, 0);
         three.group.add(mesh);
         piecesRef.current.push({
           home,
-          cell,
+          cell: order[home],
           mesh,
           geometry,
-          material,
-          texture,
-          target: new THREE.Vector3(x, y, 0),
+          target: new THREE.Vector3(start.x, start.y, 0),
         });
       }
 
@@ -297,9 +318,9 @@ export default function ImagePuzzleCanvas() {
   );
 
   const handleShuffle = useCallback(() => {
-    const metrics = gridRef.current;
+    const layout = layoutRef.current;
     const pieces = piecesRef.current;
-    if (!metrics || pieces.length === 0) return;
+    if (!layout || pieces.length === 0) return;
     const order = scrambleOrder(pieces.length);
     pieces.forEach((piece, i) => {
       piece.cell = order[i];
@@ -335,6 +356,13 @@ export default function ImagePuzzleCanvas() {
   const handleSelectGrid = useCallback((cols: number, rows: number) => {
     setGrid({ cols, rows });
   }, []);
+
+  const handleSelectShape = useCallback((next: PieceShape) => {
+    setShape(next);
+  }, []);
+
+  const shapeLabel =
+    SHAPES.find((preset) => preset.id === shape)?.label ?? "Classic";
 
   const handleUpload = useCallback(async (file: File) => {
     if (!file.type.startsWith("image/")) {
@@ -424,8 +452,10 @@ export default function ImagePuzzleCanvas() {
     const fit = () => {
       const w = mount.clientWidth || 1;
       const h = mount.clientHeight || 1;
+      const layout = layoutRef.current;
+      const span = Math.max(layout?.width ?? BOARD, layout?.height ?? BOARD);
       const vFov = (camera.fov * Math.PI) / 180;
-      const distV = (BOARD * FIT_MARGIN) / (2 * Math.tan(vFov / 2));
+      const distV = (span * FIT_MARGIN) / (2 * Math.tan(vFov / 2));
       const distH = distV / (w / h);
       const dist = Math.max(distV, distH);
       camera.position.copy(viewDir).multiplyScalar(dist);
@@ -575,21 +605,21 @@ export default function ImagePuzzleCanvas() {
         return;
       }
 
-      const metrics = gridRef.current;
-      if (!metrics) return;
-      const { cols, rows, pieceW, pieceH } = metrics;
-      const halfW = (cols * pieceW) / 2;
-      const halfH = (rows * pieceH) / 2;
+      const layout = layoutRef.current;
+      if (!layout || event.type === "pointercancel") return;
       const px = piece.mesh.position.x;
       const py = piece.mesh.position.y;
-
-      if (event.type !== "pointercancel" && Math.abs(px) <= halfW && Math.abs(py) <= halfH) {
-        let c = Math.round(px / pieceW + (cols - 1) / 2);
-        let r = Math.round((rows - 1) / 2 - py / pieceH);
-        c = Math.max(0, Math.min(cols - 1, c));
-        r = Math.max(0, Math.min(rows - 1, r));
-        swapToCell(piece, r * cols + c);
+      let nearest = piece.cell;
+      let best = Infinity;
+      for (let i = 0; i < layout.cells.length; i += 1) {
+        const c = layout.cells[i].center;
+        const d = Math.hypot(px - c.x, py - c.y);
+        if (d < best) {
+          best = d;
+          nearest = i;
+        }
       }
+      if (best <= layout.spacing) swapToCell(piece, nearest);
       hoverRef.current = null;
       updateTargets();
     };
@@ -649,8 +679,8 @@ export default function ImagePuzzleCanvas() {
 
   useEffect(() => {
     if (!source) return;
-    buildBoard(source, grid);
-  }, [source, grid, buildBoard]);
+    buildBoard(source, grid, shape);
+  }, [source, grid, shape, buildBoard]);
 
   /* ------------------------------- HUD ---------------------------------- */
 
@@ -712,7 +742,7 @@ export default function ImagePuzzleCanvas() {
               aria-live="polite"
               className="shrink-0 rounded-full border border-white/10 bg-black/40 px-3 py-2 text-xs font-medium text-white/85 backdrop-blur-md"
             >
-              {placed}/{grid.cols * grid.rows} · swaps: {moves}
+              {shapeLabel} · {placed}/{grid.cols * grid.rows} · swaps: {moves}
             </div>
             <Button
               size="sm"
@@ -799,14 +829,14 @@ export default function ImagePuzzleCanvas() {
           solved={solved}
           cols={grid.cols}
           rows={grid.rows}
+          shape={shape}
           previewUrl={previewUrl}
           activeSample={activeSample}
           uploading={uploading}
           onSelectSample={handleSelectSample}
           onUpload={handleUpload}
           onSelectGrid={handleSelectGrid}
-          onShuffle={handleShuffle}
-          onReset={handleReset}
+          onSelectShape={handleSelectShape}
         />
       </aside>
 

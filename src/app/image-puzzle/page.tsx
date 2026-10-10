@@ -5,10 +5,13 @@ import ImagePuzzleWrapper from "@/components/ImagePuzzleWrapper";
 export const metadata: Metadata = {
   title: "Photo Jigsaw · Image swap puzzle (vanilla Three.js)",
   description:
-    "Turn any picture into a 3D jigsaw: choose a built-in sample or upload / drop your own image, scramble it into tiles on a 3D board, then drag the tiles back into place to rebuild the picture. Vanilla Three.js, static export, mouse + touch.",
+    "Turn any picture into a 3D jigsaw: choose a built-in sample or upload / drop your own image, pick a puzzle type (classic squares, interlocking jigsaw, honeycomb hexagons or triangle mosaic), scramble the pieces on a 3D board, then drag them back into place to rebuild the picture. Vanilla Three.js, static export, mouse + touch.",
   keywords: [
     "photo puzzle",
     "jigsaw",
+    "jigsaw puzzle types",
+    "hexagon puzzle",
+    "triangle puzzle",
     "sliding tiles",
     "image puzzle",
     "Three.js",
@@ -27,7 +30,7 @@ const jsonLd = {
   operatingSystem: "Web",
   browserRequirements: "Requires WebGL",
   description:
-    "Turn any picture into a scrambled 3D jigsaw. Choose a built-in sample or upload your own image, then drag the scrambled tiles back into place to rebuild the original picture.",
+    "Turn any picture into a scrambled 3D jigsaw. Choose a built-in sample or upload your own image, pick a puzzle type (classic, jigsaw knobs, honeycomb or triangle mosaic), then drag the scrambled pieces back into place to rebuild the original picture.",
   offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
   isAccessibleForFree: true,
 };

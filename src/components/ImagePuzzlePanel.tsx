@@ -5,28 +5,38 @@
  * ================
  * Left studio panel for the "Photo Jigsaw" puzzle, matching the layout language
  * of the Rubik's Cube and Clover Pyramid panels: choose an image (samples or
- * upload), pick a difficulty, watch a live reference preview + progress, and
- * shuffle / reset the board.
+ * upload), pick a puzzle type + difficulty, and watch a live reference preview
+ * with progress. Shuffle / reset live in the board's top bar.
  */
 
 import { useMemo, useRef } from "react";
 import {
   Check,
+  Hexagon,
   Image as ImageIcon,
   MousePointer2,
-  RotateCcw,
-  Shuffle,
+  Puzzle,
   Sparkles,
+  Square,
+  Triangle,
   Upload,
 } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
 import {
   DIFFICULTIES,
   SAMPLES,
+  SHAPES,
   renderSample,
+  type PieceShape,
   type SampleId,
 } from "@/lib/imagePuzzle";
+
+const SHAPE_ICONS: Record<PieceShape, typeof Square> = {
+  classic: Square,
+  jigsaw: Puzzle,
+  hexagon: Hexagon,
+  triangle: Triangle,
+};
 
 interface ImagePuzzlePanelProps {
   moveCount: number;
@@ -35,14 +45,14 @@ interface ImagePuzzlePanelProps {
   solved: boolean;
   cols: number;
   rows: number;
+  shape: PieceShape;
   previewUrl: string | null;
   activeSample: SampleId | null;
   uploading: boolean;
   onSelectSample: (id: SampleId) => void;
   onUpload: (file: File) => void;
   onSelectGrid: (cols: number, rows: number) => void;
-  onShuffle: () => void;
-  onReset: () => void;
+  onSelectShape: (shape: PieceShape) => void;
 }
 
 export default function ImagePuzzlePanel({
@@ -52,14 +62,14 @@ export default function ImagePuzzlePanel({
   solved,
   cols,
   rows,
+  shape,
   previewUrl,
   activeSample,
   uploading,
   onSelectSample,
   onUpload,
   onSelectGrid,
-  onShuffle,
-  onReset,
+  onSelectShape,
 }: ImagePuzzlePanelProps) {
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -178,6 +188,41 @@ export default function ImagePuzzlePanel({
         </p>
       </section>
 
+      {/* ------------------------------ puzzle type --------------------------- */}
+      <section className="rounded-2xl border border-white/10 bg-white/[0.04] p-3">
+        <h2 className="mb-2.5 text-xs font-semibold tracking-tight text-white/85">
+          Puzzle type
+        </h2>
+        <div className="grid grid-cols-2 gap-2">
+          {SHAPES.map((preset) => {
+            const Icon = SHAPE_ICONS[preset.id];
+            const active = shape === preset.id;
+            return (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => onSelectShape(preset.id)}
+                className={`flex items-center gap-2 rounded-lg border px-2.5 py-2 text-left transition-all ${
+                  active
+                    ? "border-sky-400/60 bg-sky-500/15 text-white"
+                    : "border-white/10 bg-black/20 text-white/60 hover:bg-white/10 hover:text-white/85"
+                }`}
+              >
+                <Icon className="size-4 shrink-0" aria-hidden />
+                <span className="min-w-0">
+                  <span className="block text-xs font-medium">
+                    {preset.label}
+                  </span>
+                  <span className="block text-[10px] text-white/40">
+                    {preset.hint}
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
       {/* ----------------------------- difficulty ----------------------------- */}
       <section className="rounded-2xl border border-white/10 bg-white/[0.04] p-3">
         <h2 className="mb-2.5 text-xs font-semibold tracking-tight text-white/85">
@@ -255,25 +300,6 @@ export default function ImagePuzzlePanel({
           </div>
         </div>
       </section>
-
-      {/* ------------------------------- actions ------------------------------ */}
-      <div className="mt-auto grid grid-cols-2 gap-2 pt-1">
-        <Button
-          type="button"
-          variant="outline"
-          onClick={onShuffle}
-          className="h-10 border-white/15 bg-white/10 text-white hover:bg-white/20 hover:text-white"
-        >
-          <Shuffle className="size-4" /> Shuffle
-        </Button>
-        <Button
-          type="button"
-          onClick={onReset}
-          className="h-10 bg-gradient-to-br from-fuchsia-500 to-violet-600 text-white hover:opacity-90"
-        >
-          <RotateCcw className="size-4" /> Reset
-        </Button>
-      </div>
     </div>
   );
 }

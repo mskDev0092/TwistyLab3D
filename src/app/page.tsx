@@ -58,9 +58,9 @@ const games: Game[] = [
   {
     href: "/image-puzzle",
     name: "Photo Jigsaw",
-    tagline: "Any picture, scrambled",
+    tagline: "Any picture, four shapes",
     blurb:
-      "Turn any photo into a sliding board puzzle. Pick a sample or drop your own image, then drag the scrambled tiles back into place to rebuild it.",
+      "Turn any photo into a sliding board puzzle — classic squares, interlocking jigsaw, honeycomb hexagons or a triangle mosaic. Pick a sample or drop your own image, then drag the pieces back into place.",
     level: "Relaxing",
     Icon: ImageIcon,
     accent: "from-amber-400 to-rose-500",
