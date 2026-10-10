@@ -3,25 +3,24 @@
 /**
  * ImagePuzzleCanvas
  * =================
- * Browser-only Three.js renderer for the "Photo Jigsaw" puzzle: any picture
- * (built-in sample, upload, or dropped file) is cut into interlocking pieces —
- * squares, jigsaw knobs, hexagons or triangle mosaic — that start scrambled on
- * a board. All pieces share one board texture whose UVs are derived from each
- * piece's position, so the picture stays seamless whatever the shape.
+ * Browser-only Three.js renderer for the "Photo Jigsaw" puzzle, styled as a
+ * cosy craft table: any picture (built-in sample, upload, or dropped file) is
+ * cut into interlocking pieces — squares, jigsaw knobs, hexagons or triangle
+ * mosaic — then scattered across a soft pastel floor. All pieces share one
+ * board texture whose UVs are derived from each piece's position, so the
+ * picture stays seamless whatever the shape.
  *
- * Drag one piece onto another (or tap two pieces) to swap them; arrange every
- * piece back into its home slot to solve the picture.
+ * Interaction
+ * -----------
+ * - Grab a piece and drag it anywhere on the floor (free placement, like a
+ *   real puzzle). Drop it near its slot and it snaps home; drop it on another
+ *   piece's slot and the two swap.
+ * - A tap (no movement) selects a piece; tapping a second piece swaps the two.
+ * - Drag the background to orbit the camera around the table.
  *
  * Loaded through `next/dynamic { ssr: false }` (see ImagePuzzleWrapper), so
  * `window`/`document` always exist. All GPU resources are created in one
  * `useEffect` and torn down in its cleanup.
- *
- * Interaction
- * -----------
- * - Pointer down on a tile  -> we take over (capture phase, OrbitControls off):
- *   drag the tile around; on release it swaps with whatever tile is nearest.
- * - A tap (no movement) selects a tile; tapping a second tile swaps the two.
- * - Pointer down on empty space -> OrbitControls gently orbits the board.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -41,7 +40,7 @@ import {
   loadImage,
   makePreview,
   renderSample,
-  scrambleOrder,
+  scatterPositions,
   type BoardLayout,
   type PieceCell,
   type PieceShape,
@@ -53,11 +52,12 @@ import {
 const BOARD = 4; // world-units target edge length of the board
 const PIECE_DEPTH = 0.08;
 const MASTER_PX = 1024; // long-edge resolution of the shared board texture
+const FLOOR_MULT = 2.3; // floor size relative to the board span
 const DRAG_Z = 0.6;
 const HOVER_Z = 0.08;
 const SELECT_Z = 0.16;
 const CAMERA_FOV = 42;
-const FIT_MARGIN = 1.18;
+const FIT_MARGIN = 1.06;
 
 /* -------------------------------- types ---------------------------------- */
 
@@ -74,9 +74,10 @@ interface GridDims {
 
 interface PieceRef {
   home: number;
-  cell: number;
+  cell: number; // home slot index when snapped home; -1 when free on the floor
   mesh: THREE.Mesh;
   geometry: THREE.BufferGeometry;
+  base: THREE.Vector3; // resting position on the floor (z = 0)
   target: THREE.Vector3;
 }
 
@@ -106,6 +107,15 @@ interface DragState {
 function createSampleSource(id: SampleId): SourceImage {
   const canvas = renderSample(id, 1024);
   return { el: canvas, width: canvas.width, height: canvas.height };
+}
+
+/** Cover-cropped square thumbnail data-URL for the panel's reference image. */
+function previewOf(src: SourceImage): string {
+  return makePreview({
+    source: src.el as CanvasImageSource,
+    width: src.width,
+    height: src.height,
+  });
 }
 
 /**
@@ -143,18 +153,98 @@ function createPieceGeometry(
   return geometry;
 }
 
-const previewOf = (src: SourceImage): string =>
-  makePreview({ source: src.el, width: src.width, height: src.height }, 256);
+/** A soft pastel craft-mat texture with a faded edge (so it reads as round). */
+function makeFloorTexture(): THREE.CanvasTexture {
+  const size = 1024;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const tex = new THREE.CanvasTexture(canvas);
+  if (!ctx) return tex;
+
+  const base = ctx.createLinearGradient(0, 0, size, size);
+  base.addColorStop(0, "#f4ecff");
+  base.addColorStop(0.45, "#eef2ff");
+  base.addColorStop(1, "#e3fbf7");
+  ctx.fillStyle = base;
+  ctx.fillRect(0, 0, size, size);
+
+  // Soft pastel blobs for a hand-made feel.
+  const blobs: Array<[number, number, number, string]> = [
+    [size * 0.24, size * 0.22, size * 0.34, "rgba(255,138,190,0.30)"],
+    [size * 0.8, size * 0.28, size * 0.32, "rgba(120,180,255,0.30)"],
+    [size * 0.68, size * 0.82, size * 0.36, "rgba(150,240,200,0.30)"],
+    [size * 0.2, size * 0.8, size * 0.3, "rgba(255,214,140,0.28)"],
+  ];
+  for (const [cx, cy, r, color] of blobs) {
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    g.addColorStop(0, color);
+    g.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+  }
+
+  // Faint dotted grid.
+  ctx.fillStyle = "rgba(120,110,180,0.12)";
+  const step = size / 20;
+  for (let y = step / 2; y < size; y += step) {
+    for (let x = step / 2; x < size; x += step) {
+      ctx.beginPath();
+      ctx.arc(x, y, 2.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Fade the edges so the mat blends into the dark room.
+  const fade = ctx.createRadialGradient(
+    size / 2,
+    size / 2,
+    size * 0.34,
+    size / 2,
+    size / 2,
+    size * 0.62,
+  );
+  fade.addColorStop(0, "rgba(0,0,0,0)");
+  fade.addColorStop(1, "rgba(10,12,20,0.92)");
+  ctx.globalCompositeOperation = "destination-out";
+  ctx.fillStyle = fade;
+  ctx.fillRect(0, 0, size, size);
+  ctx.globalCompositeOperation = "source-over";
+
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+/** Recursively dispose an object's geometries + materials/textures. */
+function disposeObject(object: THREE.Object3D): void {
+  object.traverse((node) => {
+    const mesh = node as THREE.Mesh;
+    if (mesh.geometry) mesh.geometry.dispose();
+    const material = (mesh as THREE.Mesh).material;
+    const list = Array.isArray(material) ? material : material ? [material] : [];
+    for (const m of list) {
+      const anyMat = m as THREE.Material & { map?: THREE.Texture | null };
+      if (anyMat.map) anyMat.map.dispose();
+      m.dispose();
+    }
+  });
+}
+
+/* --------------------------------- component ------------------------------ */
 
 export default function ImagePuzzleCanvas() {
   const mountRef = useRef<HTMLDivElement>(null);
-  const threeRef = useRef<SceneRefs | null>(null);
   const piecesRef = useRef<PieceRef[]>([]);
   const layoutRef = useRef<BoardLayout | null>(null);
+  const decorRef = useRef<THREE.Group | null>(null);
   const assetsRef = useRef<{
     texture: THREE.Texture;
     material: THREE.Material;
   } | null>(null);
+  const seedRef = useRef(1);
+  const threeRef = useRef<SceneRefs | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const selectedRef = useRef<PieceRef | null>(null);
   const hoverRef = useRef<PieceRef | null>(null);
@@ -182,6 +272,12 @@ export default function ImagePuzzleCanvas() {
 
   /* --------------------------- board helpers --------------------------- */
 
+  const floorSpan = useCallback((): number => {
+    const layout = layoutRef.current;
+    const span = Math.max(layout?.width ?? BOARD, layout?.height ?? BOARD);
+    return span * FLOOR_MULT;
+  }, []);
+
   const clearBoard = useCallback(() => {
     const three = threeRef.current;
     if (!three) return;
@@ -190,6 +286,11 @@ export default function ImagePuzzleCanvas() {
       piece.geometry.dispose();
     }
     piecesRef.current = [];
+    if (decorRef.current) {
+      three.scene.remove(decorRef.current);
+      disposeObject(decorRef.current);
+      decorRef.current = null;
+    }
     if (assetsRef.current) {
       assetsRef.current.texture.dispose();
       assetsRef.current.material.dispose();
@@ -211,40 +312,54 @@ export default function ImagePuzzleCanvas() {
   }, []);
 
   const updateTargets = useCallback(() => {
-    const layout = layoutRef.current;
-    if (!layout) return;
     for (const piece of piecesRef.current) {
       if (dragRef.current?.piece === piece) continue;
-      const center = layout.cells[piece.cell].center;
       const z =
         selectedRef.current === piece
           ? SELECT_Z
           : hoverRef.current === piece
             ? HOVER_Z
             : 0;
-      piece.target.set(center.x, center.y, z);
+      piece.target.set(piece.base.x, piece.base.y, z);
     }
   }, []);
 
-  const swapToCell = useCallback(
+  const scatterPieces = useCallback(() => {
+    const pieces = piecesRef.current;
+    if (pieces.length === 0) return;
+    seedRef.current += 1;
+    const spots = scatterPositions(pieces.length, floorSpan(), seedRef.current);
+    pieces.forEach((piece, i) => {
+      piece.cell = -1;
+      piece.base.set(spots[i].x, spots[i].y, 0);
+    });
+    selectedRef.current = null;
+    hoverRef.current = null;
+    updateTargets();
+  }, [floorSpan, updateTargets]);
+
+  /** Move `piece` so it snaps into `targetCell`, swapping with any occupant. */
+  const dropIntoCell = useCallback(
     (piece: PieceRef, targetCell: number) => {
-      if (piece.cell === targetCell) return;
+      const layout = layoutRef.current;
+      if (!layout) return false;
       const other = piecesRef.current.find(
         (p) => p !== piece && p.cell === targetCell,
       );
-      if (!other) {
-        piece.cell = targetCell;
-        updateTargets();
-        return;
+      const prevBase = piece.base.clone();
+      const prevCell = piece.cell;
+      if (other) {
+        other.cell = prevCell;
+        other.base.copy(prevBase);
       }
-      const tmp = piece.cell;
-      piece.cell = other.cell;
-      other.cell = tmp;
+      piece.cell = targetCell;
+      const center = layout.cells[targetCell].center;
+      piece.base.set(center.x, center.y, 0);
       setMoves((m) => m + 1);
       refreshProgress();
-      updateTargets();
+      return true;
     },
-    [refreshProgress, updateTargets],
+    [refreshProgress],
   );
 
   const handleTap = useCallback(
@@ -253,14 +368,21 @@ export default function ImagePuzzleCanvas() {
       if (selected === piece) {
         selectedRef.current = null;
       } else if (selected) {
-        swapToCell(piece, selected.cell);
+        const base = selected.base.clone();
+        const cell = selected.cell;
+        selected.base.copy(piece.base);
+        selected.cell = piece.cell;
+        piece.base.copy(base);
+        piece.cell = cell;
         selectedRef.current = null;
+        setMoves((m) => m + 1);
+        refreshProgress();
       } else {
         selectedRef.current = piece;
       }
       updateTargets();
     },
-    [swapToCell, updateTargets],
+    [refreshProgress, updateTargets],
   );
 
   const buildBoard = useCallback(
@@ -271,7 +393,45 @@ export default function ImagePuzzleCanvas() {
 
       const layout = buildLayout(shapeId, dims.cols, dims.rows, BOARD);
       layoutRef.current = layout;
+      const floor = floorSpan();
 
+      // ----- room decor: the craft-table mat + faint home-slot ghosts -------
+      const decor = new THREE.Group();
+      const floorMesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(floor, floor),
+        new THREE.MeshBasicMaterial({
+          map: makeFloorTexture(),
+          transparent: true,
+          depthWrite: false,
+        }),
+      );
+      floorMesh.position.z = -0.014;
+      decor.add(floorMesh);
+
+      const ghostMaterial = new THREE.MeshBasicMaterial({
+        color: 0x2b3044,
+        transparent: true,
+        opacity: 0.16,
+        depthWrite: false,
+      });
+      for (const cell of layout.cells) {
+        const ghostShape = new THREE.Shape();
+        cell.points.forEach((p, i) => {
+          if (i === 0) ghostShape.moveTo(p.x, p.y);
+          else ghostShape.lineTo(p.x, p.y);
+        });
+        ghostShape.closePath();
+        const ghost = new THREE.Mesh(
+          new THREE.ShapeGeometry(ghostShape),
+          ghostMaterial,
+        );
+        ghost.position.z = -0.006;
+        decor.add(ghost);
+      }
+      three.scene.add(decor);
+      decorRef.current = decor;
+
+      // ----- the picture ---------------------------------------------------
       const master = buildMasterCanvas(
         { source: src.el, width: src.width, height: src.height },
         layout.width,
@@ -283,13 +443,12 @@ export default function ImagePuzzleCanvas() {
       texture.anisotropy = three.maxAniso;
       const material = new THREE.MeshStandardMaterial({
         map: texture,
-        roughness: 0.85,
+        roughness: 0.8,
         metalness: 0,
       });
       assetsRef.current = { texture, material };
 
-      const order = scrambleOrder(layout.cells.length);
-
+      const spots = scatterPositions(layout.cells.length, floor, seedRef.current);
       for (let home = 0; home < layout.cells.length; home += 1) {
         const geometry = createPieceGeometry(
           layout.cells[home],
@@ -297,15 +456,15 @@ export default function ImagePuzzleCanvas() {
           layout.height,
         );
         const mesh = new THREE.Mesh(geometry, [material, three.sideMaterial]);
-        const start = layout.cells[order[home]].center;
-        mesh.position.set(start.x, start.y, 0);
+        mesh.position.set(spots[home].x, spots[home].y, 0);
         three.group.add(mesh);
         piecesRef.current.push({
           home,
-          cell: order[home],
+          cell: -1,
           mesh,
           geometry,
-          target: new THREE.Vector3(start.x, start.y, 0),
+          base: new THREE.Vector3(spots[home].x, spots[home].y, 0),
+          target: new THREE.Vector3(spots[home].x, spots[home].y, 0),
         });
       }
 
@@ -314,30 +473,25 @@ export default function ImagePuzzleCanvas() {
       updateTargets();
       three.fit();
     },
-    [clearBoard, refreshProgress, updateTargets],
+    [clearBoard, floorSpan, refreshProgress, updateTargets],
   );
 
   const handleShuffle = useCallback(() => {
+    if (piecesRef.current.length === 0) return;
+    scatterPieces();
+    setMoves(0);
+    refreshProgress();
+    toast.message("Scattered — rebuild the picture!");
+  }, [refreshProgress, scatterPieces]);
+
+  const handleReset = useCallback(() => {
     const layout = layoutRef.current;
     const pieces = piecesRef.current;
     if (!layout || pieces.length === 0) return;
-    const order = scrambleOrder(pieces.length);
-    pieces.forEach((piece, i) => {
-      piece.cell = order[i];
-    });
-    selectedRef.current = null;
-    hoverRef.current = null;
-    setMoves(0);
-    refreshProgress();
-    updateTargets();
-    toast.message("Shuffled — rebuild the picture!");
-  }, [refreshProgress, updateTargets]);
-
-  const handleReset = useCallback(() => {
-    const pieces = piecesRef.current;
-    if (pieces.length === 0) return;
     pieces.forEach((piece) => {
       piece.cell = piece.home;
+      const center = layout.cells[piece.home].center;
+      piece.base.set(center.x, center.y, 0);
     });
     selectedRef.current = null;
     hoverRef.current = null;
@@ -417,25 +571,26 @@ export default function ImagePuzzleCanvas() {
       CAMERA_FOV,
       (mount.clientWidth || 1) / (mount.clientHeight || 1),
       0.1,
-      100,
+      200,
     );
-    const viewDir = new THREE.Vector3(0, 0.26, 1).normalize();
+    const viewDir = new THREE.Vector3(0, 0.24, 1).normalize();
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
     controls.enablePan = false;
     controls.rotateSpeed = 0.6;
-    controls.minPolarAngle = 0.5;
+    controls.zoomSpeed = 0.8;
+    controls.minPolarAngle = 0.35;
     controls.maxPolarAngle = 1.98;
-    controls.minAzimuthAngle = -0.7;
-    controls.maxAzimuthAngle = 0.7;
+    controls.minAzimuthAngle = -0.9;
+    controls.maxAzimuthAngle = 0.9;
 
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x1b2433, 1.1));
-    const key = new THREE.DirectionalLight(0xffffff, 1.15);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x2b2f45, 1.15));
+    const key = new THREE.DirectionalLight(0xffffff, 1.1);
     key.position.set(2.5, 3.5, 6);
     scene.add(key);
-    const rim = new THREE.DirectionalLight(0x99b7ff, 0.5);
+    const rim = new THREE.DirectionalLight(0x9db6ff, 0.5);
     rim.position.set(-4, -1, 3);
     scene.add(rim);
 
@@ -444,16 +599,15 @@ export default function ImagePuzzleCanvas() {
 
     const raycaster = new THREE.Raycaster();
     const sideMaterial = new THREE.MeshStandardMaterial({
-      color: 0x2a2f3a,
-      roughness: 0.9,
+      color: 0xece4d2,
+      roughness: 0.82,
       metalness: 0,
     });
 
     const fit = () => {
       const w = mount.clientWidth || 1;
       const h = mount.clientHeight || 1;
-      const layout = layoutRef.current;
-      const span = Math.max(layout?.width ?? BOARD, layout?.height ?? BOARD);
+      const span = floorSpan();
       const vFov = (camera.fov * Math.PI) / 180;
       const distV = (span * FIT_MARGIN) / (2 * Math.tan(vFov / 2));
       const distH = distV / (w / h);
@@ -461,8 +615,8 @@ export default function ImagePuzzleCanvas() {
       camera.position.copy(viewDir).multiplyScalar(dist);
       camera.lookAt(0, 0, 0);
       controls.target.set(0, 0, 0);
-      controls.minDistance = dist * 0.7;
-      controls.maxDistance = dist * 1.7;
+      controls.minDistance = dist * 0.35;
+      controls.maxDistance = dist * 1.25;
       controls.update();
     };
 
@@ -482,6 +636,14 @@ export default function ImagePuzzleCanvas() {
 
     /* ----- pointer interaction -------------------------------- */
 
+    const clampToFloor = (x: number, y: number): THREE.Vector2 => {
+      const half = floorSpan() / 2 - 0.08;
+      return new THREE.Vector2(
+        Math.max(-half, Math.min(half, x)),
+        Math.max(-half, Math.min(half, y)),
+      );
+    };
+
     const raycastPiece = (): PieceRef | null => {
       if (piecesRef.current.length === 0) return null;
       raycaster.setFromCamera(pointerRef.current, camera);
@@ -490,9 +652,7 @@ export default function ImagePuzzleCanvas() {
         false,
       );
       if (hits.length === 0) return null;
-      return (
-        piecesRef.current.find((p) => p.mesh === hits[0].object) ?? null
-      );
+      return piecesRef.current.find((p) => p.mesh === hits[0].object) ?? null;
     };
 
     const pointOnBoard = (): THREE.Vector3 | null => {
@@ -562,10 +722,12 @@ export default function ImagePuzzleCanvas() {
         );
         const hit = pointOnBoard();
         if (hit) {
-          const x = hit.x + drag.offset.x;
-          const y = hit.y + drag.offset.y;
-          drag.piece.mesh.position.set(x, y, DRAG_Z);
-          drag.piece.target.set(x, y, DRAG_Z);
+          const spot = clampToFloor(
+            hit.x + drag.offset.x,
+            hit.y + drag.offset.y,
+          );
+          drag.piece.mesh.position.set(spot.x, spot.y, DRAG_Z);
+          drag.piece.target.set(spot.x, spot.y, DRAG_Z);
         }
         return;
       }
@@ -606,10 +768,13 @@ export default function ImagePuzzleCanvas() {
       }
 
       const layout = layoutRef.current;
-      if (!layout || event.type === "pointercancel") return;
+      if (!layout || event.type === "pointercancel") {
+        updateTargets();
+        return;
+      }
       const px = piece.mesh.position.x;
       const py = piece.mesh.position.y;
-      let nearest = piece.cell;
+      let nearest = -1;
       let best = Infinity;
       for (let i = 0; i < layout.cells.length; i += 1) {
         const c = layout.cells[i].center;
@@ -619,7 +784,14 @@ export default function ImagePuzzleCanvas() {
           nearest = i;
         }
       }
-      if (best <= layout.spacing) swapToCell(piece, nearest);
+      if (nearest >= 0 && best <= layout.spacing) {
+        dropIntoCell(piece, nearest);
+      } else {
+        // Free drop: leave the piece where it landed, clamped to the mat.
+        const clamped = clampToFloor(px, py);
+        piece.cell = -1;
+        piece.base.set(clamped.x, clamped.y, 0);
+      }
       hoverRef.current = null;
       updateTargets();
     };
@@ -673,7 +845,13 @@ export default function ImagePuzzleCanvas() {
       renderer.domElement.remove();
       threeRef.current = null;
     };
-  }, [clearBoard, handleTap, swapToCell, updateTargets]);
+  }, [
+    clearBoard,
+    dropIntoCell,
+    floorSpan,
+    handleTap,
+    updateTargets,
+  ]);
 
   /* ------------------------- rebuild on changes ------------------------ */
 
@@ -701,15 +879,15 @@ export default function ImagePuzzleCanvas() {
         if (file) void handleUpload(file);
       }}
     >
-      {/* ========================= 3D board (right) ========================= */}
+      {/* ========================= 3D table (right) ========================= */}
       <section
         id="puzzle-section"
-        className="relative min-h-0 min-w-0 w-full flex-1 basis-[52dvh] overflow-hidden bg-[radial-gradient(ellipse_at_center,#1e2233_0%,#0d1019_58%,#05060a_100%)] lg:basis-auto"
+        className="relative min-h-0 min-w-0 w-full flex-1 basis-[52dvh] overflow-hidden bg-[radial-gradient(ellipse_at_center,#2a2440_0%,#12121f_60%,#05060a_100%)] lg:basis-auto"
       >
         <div
           ref={mountRef}
           role="application"
-          aria-label="Interactive 3D photo jigsaw board. Drag a tile onto another to swap them, drag the background to orbit the camera."
+          aria-label="Interactive 3D photo jigsaw table. Drag a piece around the floor to place it; drag the background to orbit the camera."
           className={`absolute inset-0 touch-none transition-opacity duration-700 ${
             ready ? "opacity-100" : "opacity-0"
           }`}
@@ -725,14 +903,14 @@ export default function ImagePuzzleCanvas() {
               </span>
             </h1>
             <p className="mt-0.5 hidden text-[11px] leading-snug text-white/55 sm:block">
-              Drag a tile onto another to swap · drag the background to orbit
+              Drag pieces around the table · drop them home to snap
             </p>
           </div>
 
           <div className="pointer-events-auto flex items-center gap-1.5 sm:gap-2">
             <Link
               href="/"
-              aria-label="Back to all puzzles"
+              aria-label="Back to the puzzle room"
               className="flex h-9 items-center gap-1.5 rounded-md border border-white/15 bg-white/10 px-3 text-xs font-medium text-white/85 backdrop-blur-md transition-colors hover:bg-white/20 sm:h-10"
             >
               <Home className="size-4" />
@@ -742,7 +920,7 @@ export default function ImagePuzzleCanvas() {
               aria-live="polite"
               className="shrink-0 rounded-full border border-white/10 bg-black/40 px-3 py-2 text-xs font-medium text-white/85 backdrop-blur-md"
             >
-              {shapeLabel} · {placed}/{grid.cols * grid.rows} · swaps: {moves}
+              {shapeLabel} · {placed}/{grid.cols * grid.rows} · moves: {moves}
             </div>
             <Button
               size="sm"
@@ -751,7 +929,7 @@ export default function ImagePuzzleCanvas() {
               className="h-9 border-white/15 bg-white/10 px-3 text-white hover:bg-white/20 hover:text-white sm:h-10"
             >
               <Shuffle className="size-4" />
-              <span className="hidden sm:inline">Shuffle</span>
+              <span className="hidden sm:inline">Scatter</span>
             </Button>
             <Button
               size="sm"
@@ -770,13 +948,13 @@ export default function ImagePuzzleCanvas() {
           <div className="pointer-events-none absolute inset-x-0 top-16 z-10 flex justify-center px-4 sm:top-20">
             <div className="flex items-center gap-2 rounded-full bg-emerald-500/90 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-500/25">
               <PartyPopper className="size-4" aria-hidden />
-              Picture complete — {moves} swaps!
+              Picture complete — {moves} moves!
             </div>
           </div>
         )}
 
         <p className="pointer-events-none absolute inset-x-0 bottom-3 z-10 text-center text-[10px] text-white/35 sm:text-[11px]">
-          Drag a tile onto another to swap · tap two tiles · drag the background to orbit
+          Drag a piece anywhere (free placement) · drop near its slot to snap · tap two to swap
         </p>
 
         {/* Drop-a-file overlay */}

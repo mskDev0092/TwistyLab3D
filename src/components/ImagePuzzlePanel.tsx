@@ -97,11 +97,11 @@ export default function ImagePuzzlePanel({
             <h1 className="text-sm font-semibold tracking-tight text-white">
               Photo Jigsaw
               <span className="ml-1.5 font-normal text-white/40">
-                — swap the tiles back
+                — drag the pieces home
               </span>
             </h1>
             <p className="text-[11px] leading-snug text-white/45">
-              Pick a picture · drag tiles to rebuild it
+              Pick a picture · rebuild it on the table
             </p>
           </div>
         </div>
@@ -109,7 +109,7 @@ export default function ImagePuzzlePanel({
           aria-live="polite"
           className="shrink-0 rounded-full border border-white/10 bg-black/40 px-2.5 py-1 text-[10px] font-medium text-white/55"
         >
-          {solved ? "solved" : `${placed}/${total}`} · swaps: {moveCount}
+          {solved ? "solved" : `${placed}/${total}`} · moves: {moveCount}
         </span>
       </div>
 
@@ -117,9 +117,10 @@ export default function ImagePuzzlePanel({
       <div className="flex items-start gap-2 rounded-2xl border border-white/10 bg-white/[0.04] p-3 text-[11px] leading-relaxed text-white/60">
         <MousePointer2 className="mt-0.5 size-3.5 shrink-0 text-white/40" aria-hidden />
         <p>
-          <span className="text-white/80">Drag</span> a tile onto another to swap
-          them — or <span className="text-white/80">tap</span> two tiles to swap.
-          Drag the background to orbit the board.
+          <span className="text-white/80">Drag</span> a piece anywhere on the
+          table — drop it on its slot to snap, or leave it loose. Drop it over
+          another piece&apos;s slot to <span className="text-white/80">swap</span>{" "}
+          them (or tap two pieces). Drag the background to orbit.
         </p>
       </div>
 
@@ -293,7 +294,7 @@ export default function ImagePuzzlePanel({
               ) : (
                 <>
                   <span className="font-semibold text-white/80">{placed}</span> of{" "}
-                  {total} tiles in place
+                  {total} pieces in place
                 </>
               )}
             </p>

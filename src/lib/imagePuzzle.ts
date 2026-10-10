@@ -689,6 +689,37 @@ export function makePreview(img: ImageLike, size = 256): string {
   return canvas.toDataURL("image/png");
 }
 
+/* ------------------------------ scattering -------------------------------- */
+
+/**
+ * Spread `count` pieces over a square `area` as a jittered grid — the "dumped
+ * the box out on the table" arrangement. Deterministic per (count, seed) so a
+ * build is reproducible, but each seed gives a fresh-looking pile.
+ */
+export function scatterPositions(
+  count: number,
+  area: number,
+  seed = 0,
+): Vec2[] {
+  const cols = Math.max(1, Math.ceil(Math.sqrt(count)));
+  const rows = Math.max(1, Math.ceil(count / cols));
+  const cw = area / cols;
+  const ch = area / rows;
+  const rng = mulberry32(seed * 2654435761 + count * 40503 + 1);
+  const out: Vec2[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const c = i % cols;
+    const r = Math.floor(i / cols);
+    const jx = (rng() - 0.5) * cw * 0.5;
+    const jy = (rng() - 0.5) * ch * 0.5;
+    out.push({
+      x: -area / 2 + cw * (c + 0.5) + jx,
+      y: area / 2 - ch * (r + 0.5) + jy,
+    });
+  }
+  return out;
+}
+
 /* ------------------------------ scrambling -------------------------------- */
 
 /**

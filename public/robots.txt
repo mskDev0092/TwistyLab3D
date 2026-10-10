@@ -2,8 +2,9 @@ User-agent: *
 Allow: /
 
 # ============================================================================
-# Everything on this site is OPEN to bots, crawlers and AI agents.
-# This is an interactive 3D Rubik's Cube that AIs can play remotely:
+# Twisty Lab — everything on this site is OPEN to bots, crawlers and AI agents.
+# A room of interactive 3D puzzles: Rubik's Cube, Clover Pyramid, Photo Jigsaw.
+# The Rubik's Cube page is AI-playable remotely:
 #
 #   - AI Play protocol: the page renders a self-contained prompt (instructions
 #     + notation + live 54-char Kociemba state at the end). Reply format:

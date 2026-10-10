@@ -13,10 +13,13 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+
 export const metadata: Metadata = {
-  title: "Twisty Lab — Rubik's Cube & Clover Pyramid",
+  metadataBase: new URL("https://twisty-lab.example"),
+  title: "Twisty Lab — Rubik's Cube, Clover Pyramid & Photo Jigsaw",
   description:
-    "Interactive vanilla Three.js twisty puzzles: an AI-playable Rubik's Cube and the Clover Pyramid jumbling tetrahedron. Static export, WebGL, mouse and touch.",
+    "An interactive vanilla Three.js puzzle room: an AI-playable Rubik's Cube, the Clover Pyramid jumbling tetrahedron, and a Photo Jigsaw you build on the table. Static export, WebGL, mouse and touch.",
   keywords: [
     "Twisty Lab",
     "3D puzzles",
@@ -26,22 +29,23 @@ export const metadata: Metadata = {
     "jumbling puzzle",
     "Photo Jigsaw",
     "jigsaw puzzle",
+    "jigsaw puzzle types",
   ],
   authors: [{ name: "Twisty Lab" }],
   icons: {
-    icon: "/logo.svg",
+    icon: `${basePath}/logo.svg`,
   },
   openGraph: {
     title: "Twisty Lab",
     description:
-      "Interactive Three.js twisty puzzles: Rubik's Cube and the Clover Pyramid",
+      "Interactive Three.js puzzles: Rubik's Cube, Clover Pyramid and Photo Jigsaw",
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
     title: "Twisty Lab",
     description:
-      "Interactive Three.js twisty puzzles: Rubik's Cube and the Clover Pyramid",
+      "Interactive Three.js puzzles: Rubik's Cube, Clover Pyramid and Photo Jigsaw",
   },
 };
 
