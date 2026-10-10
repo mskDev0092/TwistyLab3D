@@ -57,9 +57,20 @@ export const FACE_MOVE_AXIS: Record<
 /** Block index (0-4 in units of 9 facelets) of each face in the state string. */
 const FACE_BLOCK: Record<FaceMoveLetter, number> = { U: 0, R: 1, F: 2, D: 3, L: 4, B: 5 };
 
+/** The canonical solved-state facelet string. */
+export const SOLVED_FACELETS = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB";
+
 /** True when the string looks like a valid 54-facelet cube state. */
 export function isFaceletString(value: string): boolean {
   return /^[URFDLB]{54}$/.test(value);
+}
+
+/** Canonical token for a parsed move: R, R', R2. */
+export function moveToToken(move: ParsedMove): string {
+  return (
+    move.letter +
+    (move.quarterTurns === 1 ? "'" : move.quarterTurns === 2 ? "2" : "")
+  );
 }
 
 /* ---------------------------------------------------------------------------
@@ -92,6 +103,8 @@ function modifierToTurns(modifier: string | undefined): -1 | 1 | 2 {
  * Extract every supported move from free-form text (an AI reply, a solver
  * output, a chat message...). Prose is ignored; tokens that resemble cube
  * notation but are not supported (M, E, S, x/y/z, wide moves) are reported.
+ *
+ * Tolerates the unicode primes AIs love to emit: R′ R’ R´ all parse as R'.
  */
 export function parseMoveSequence(text: string): {
   moves: ParsedMove[];
@@ -100,7 +113,11 @@ export function parseMoveSequence(text: string): {
   const moves: ParsedMove[] = [];
   const ignored = new Set<string>();
 
-  for (const raw of text.split(/[\s,;]+/)) {
+  // Normalize look-alike primes BEFORE tokenizing, otherwise the edge-stripper
+  // would silently eat a trailing ’ / ′ and turn R' into R (a wrong move!).
+  const normalized = text.replace(/[′’´]/g, "'");
+
+  for (const raw of normalized.split(/[\s,;]+/)) {
     const token = raw.replace(STRIP_EDGES, "");
     if (!token) continue;
     const match = MOVE_TOKEN.exec(token);
@@ -145,40 +162,76 @@ export function buildFaceletNet(facelets: string): string {
   ].join("\n");
 }
 
-/** Everything an external AI needs to solve the cube, as one copyable prompt. */
+/**
+ * Everything an external AI needs to play the cube, as one copyable prompt.
+ *
+ * Contract of the generated text:
+ *   - instructions and response format FIRST (a strict `MOVES:` reply line,
+ *     plus an optional `STATE_AFTER:` line asking the AI to predict the
+ *     resulting state in the SAME facelet format, which the app verifies),
+ *   - the machine-readable CURRENT CUBE STATE block LAST, so it is trivial
+ *     to find at the very end of the prompt.
+ */
 export function buildAiPrompt(input: {
   facelets: string;
   moveCount: number;
   isSolved: boolean;
+  /** Move tokens played so far, oldest first (best effort, face turns only). */
+  history?: string[];
 }): string {
   const { facelets, moveCount, isSolved } = input;
+  const history = input.history ?? [];
+
   const lines: string[] = [
-    "Solve this 3x3 Rubik's Cube. You are controlling a real interactive cube app: the moves in your reply will be executed literally, in order.",
+    "# RUBIK'S CUBE — REMOTE-PLAY PROTOCOL v2",
+    "You are remote-controlling a REAL interactive 3D Rubik's Cube running in a web app.",
+    "The move sequence in your reply is executed on the actual cube, one animated turn at a time, and the move counter updates live.",
     "",
-    "MOVE NOTATION (standard Singmaster):",
-    '- Faces are fixed in space: U = Up/top, D = Down/bottom, L = Left, R = Right, F = Front, B = Back. They are defined by position, not by color.',
-    '- "X" = turn face X 90 degrees CLOCKWISE as seen when looking directly at that face from outside the cube. "X\'" = 90 degrees counter-clockwise. "X2" = 180 degrees.',
-    "- Use ONLY face turns. Do NOT use cube rotations (x/y/z), wide moves (u/r/f/...), or slice moves (M/E/S).",
+    "## HOW TO REPLY (strict)",
+    "Put exactly ONE move line at the end of your reply:",
+    "MOVES: <space-separated face turns>",
+    "Then optionally add ONE prediction line (it helps the human verify you):",
+    "STATE_AFTER: <the 54-character facelet string you predict AFTER your moves, in the same format as the state below>",
+    "- The app compares STATE_AFTER with the real result and shows whether your prediction matched.",
+    "- Omit STATE_AFTER if you are not confident. Put nothing after it.",
+    "- If the cube is already solved, reply exactly: Already solved",
     "",
-    "COLOR LEGEND (color of each face center in this cube):",
-    "- U = White, R = Red, F = Green, D = Yellow, L = Orange, B = Blue",
+    "## MOVE NOTATION (standard Singmaster)",
+    "- Faces are FIXED IN SPACE, defined by position — not by color:",
+    "  U = Up/top, D = Down/bottom, F = Front, B = Back, R = Right, L = Left.",
+    "- X = turn face X 90° CLOCKWISE as seen when looking directly at that face from outside the cube.",
+    "- X' = 90° counter-clockwise. X2 = 180°. Example sequence: R U R' U' F2 D L' B2",
+    "- ONLY the six face turns U R F D L B are supported.",
+    "  Cube rotations (x y z), wide moves (u r f d l b) and slice moves (M E S) are NOT supported and are skipped.",
     "",
-    `CURRENT STATUS: ${isSolved ? "Already solved." : "Scrambled - not solved."} ${moveCount} quarter-turn move(s) played so far.`,
+    "## COLOR SCHEME (fixed; centers never leave their face)",
+    "U center = White, R center = Red, F center = Green, D center = Yellow, L center = Orange, B center = Blue.",
     "",
-    "CURRENT STATE as Kociemba facelet string (54 chars, faces in order U R F D L B, 9 chars each, each face read row-major from its own outside view):",
+    "## STATE FORMAT (Kociemba facelets)",
+    "- One string of 54 letters: faces in order U R F D L B, 9 letters per face.",
+    "- Each face is read row-major (left→right, top→bottom) as seen looking straight at that face from OUTSIDE the cube.",
+    `- A SOLVED cube reads: ${SOLVED_FACELETS}`,
+    "- Every letter is a COLOR (legend above): which sticker currently sits on that facelet.",
+    "- The UNFOLDED NET renders the same state spatially: U on top, L F R B in the middle row, D at the bottom.",
+    "",
+    "## SESSION NOTES",
+    "- HISTORY lists the face turns already played (oldest first) — use it for context.",
+    "- After your moves execute you may receive an updated state in this exact format; reply the same way again. The loop can repeat indefinitely.",
+    "",
+    "==================== CURRENT CUBE STATE (machine-readable) ====================",
+    `STATUS: ${isSolved ? "ALREADY SOLVED" : "SCRAMBLED — not solved"}`,
+    `MOVES_SO_FAR: ${moveCount}   (quarter-turn metric: X2 counts as 2)`,
+    `HISTORY: ${history.length > 0 ? history.slice(-40).join(" ") : "(none — fresh cube)"}`,
+    "FACELETS (order U R F D L B · 9 chars each · row-major per face):",
     facelets,
-    "",
-    "Same state as an unfolded net (each letter is the color of that sticker, per the legend):",
+    "UNFOLDED NET (top U · middle L F R B · bottom D):",
     "",
     buildFaceletNet(facelets),
     "",
-    "YOUR TASK:",
-    "1. Work out a correct solution with any method (layer-by-layer, CFOP, two-phase, ...).",
-    "2. Put the final move sequence on the LAST line of your reply: space-separated tokens like  R U R' U' F2 D L' B2",
-    "3. Keep it correct and reasonably short (under ~60 moves). No commentary after the move line.",
+    "================================================================================",
+    isSolved
+      ? "The state above is already solved — reply 'Already solved' if you agree."
+      : "Your turn: solve the cube. Reply with the 'MOVES: ...' line (and optionally 'STATE_AFTER: ...').",
   ];
-  if (isSolved) {
-    lines.push("", "Note: the cube is already solved. If you agree, reply exactly: Already solved");
-  }
   return lines.join("\n");
 }

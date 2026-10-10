@@ -186,6 +186,73 @@ function snapQuaternion(q: THREE.Quaternion): void {
   q.setFromRotationMatrix(m);
 }
 
+/** Face letter of a snapped principal world direction. */
+function faceOfDirection(dir: THREE.Vector3): FaceMoveLetter {
+  if (dir.y !== 0) return dir.y > 0 ? "U" : "D";
+  if (dir.x !== 0) return dir.x > 0 ? "R" : "L";
+  return dir.z > 0 ? "F" : "B";
+}
+
+/**
+ * Facelet index (0-53) of the sticker on `face` carried by the cubie whose
+ * grid coordinate is `grid`. Row/column follows the standard net layout:
+ * U viewed with B at top, D viewed with F at top, side faces viewed with U
+ * at top (L has F to its right, R has F to its left, B has R to its left).
+ */
+function faceletIndexOf(face: FaceMoveLetter, grid: THREE.Vector3): number {
+  const { x, y, z } = grid;
+  let rowIndex = 0;
+  let colIndex = 0;
+  switch (face) {
+    case "U":
+      rowIndex = z + 1;
+      colIndex = x + 1;
+      break;
+    case "D":
+      rowIndex = 1 - z;
+      colIndex = x + 1;
+      break;
+    case "R":
+      rowIndex = 1 - y;
+      colIndex = 1 - z;
+      break;
+    case "L":
+      rowIndex = 1 - y;
+      colIndex = z + 1;
+      break;
+    case "F":
+      rowIndex = 1 - y;
+      colIndex = x + 1;
+      break;
+    case "B":
+      rowIndex = 1 - y;
+      colIndex = 1 - x;
+      break;
+  }
+  const block = { U: 0, R: 1, F: 2, D: 3, L: 4, B: 5 }[face];
+  return block * 9 + rowIndex * 3 + colIndex;
+}
+
+/**
+ * All 24 axis-aligned rotation matrices (the rotation group of the cube).
+ * Built once from every perpendicular (up, forward) face-pair; the third
+ * basis vector follows from the cross product, guaranteeing det = +1.
+ */
+let CACHED_ROTATIONS: THREE.Matrix4[] | null = null;
+function allCubeRotations(): THREE.Matrix4[] {
+  if (CACHED_ROTATIONS) return CACHED_ROTATIONS;
+  const matrices: THREE.Matrix4[] = [];
+  for (const up of FACE_DIRECTIONS) {
+    for (const forward of FACE_DIRECTIONS) {
+      if (Math.round(up.dot(forward)) !== 0) continue; // must be perpendicular
+      const right = new THREE.Vector3().crossVectors(up, forward);
+      matrices.push(new THREE.Matrix4().makeBasis(right, up.clone(), forward.clone()));
+    }
+  }
+  CACHED_ROTATIONS = matrices;
+  return matrices;
+}
+
 // ---------------------------------------------------------------------------
 // The logic class
 // ---------------------------------------------------------------------------
@@ -482,58 +549,115 @@ export class RubiksCubeLogic {
         const worldNormal = snapToPrincipalAxis(
           sticker.localNormal.clone().applyQuaternion(cubie.group.quaternion),
         );
-        const face: FaceMoveLetter =
-          worldNormal.y > 0
-            ? "U"
-            : worldNormal.y < 0
-              ? "D"
-              : worldNormal.x > 0
-                ? "R"
-                : worldNormal.x < 0
-                  ? "L"
-                  : worldNormal.z > 0
-                    ? "F"
-                    : "B";
-
-        // Row/column of this facelet within its face, standard net layout:
-        // U viewed with B at top, D viewed with F at top, side faces viewed
-        // with U at top (L has F to its right, R has F to its left,
-        // B has R to its left).
-        const { x, y, z } = cubie.grid;
-        let rowIndex = 0;
-        let colIndex = 0;
-        switch (face) {
-          case "U":
-            rowIndex = z + 1;
-            colIndex = x + 1;
-            break;
-          case "D":
-            rowIndex = 1 - z;
-            colIndex = x + 1;
-            break;
-          case "R":
-            rowIndex = 1 - y;
-            colIndex = 1 - z;
-            break;
-          case "L":
-            rowIndex = 1 - y;
-            colIndex = z + 1;
-            break;
-          case "F":
-            rowIndex = 1 - y;
-            colIndex = x + 1;
-            break;
-          case "B":
-            rowIndex = 1 - y;
-            colIndex = 1 - x;
-            break;
-        }
-        const block = { U: 0, R: 1, F: 2, D: 3, L: 4, B: 5 }[face];
-        cells[block * 9 + rowIndex * 3 + colIndex] =
+        const face = faceOfDirection(worldNormal);
+        cells[faceletIndexOf(face, cubie.grid)] =
           COLOR_LETTER_BY_INDEX[sticker.colorIndex];
       }
     }
     return cells.join("");
+  }
+
+  /**
+   * Rebuild the physical cube so that it matches a 54-char facelet string.
+   *
+   * For every cubie we search the 24 axis-aligned rotations for an
+   * orientation in which ALL of its stickers land on facelets showing the
+   * same color letter, stickers point outwards, no two cubies share a grid
+   * cell and all 54 facelets are covered exactly once. Only when such an
+   * assignment exists for every cubie is the state physically reachable -
+   * then (and only then) the transforms are committed. Garbage input
+   * (impossible states) is rejected with `false` and changes nothing.
+   *
+   * @returns true when the state was applied, false when rejected.
+   */
+  public applyFacelets(facelets: string): boolean {
+    if (!/^[URFDLB]{54}$/.test(facelets)) return false;
+    if (this.pivot) this.releaseSlice(0);
+
+    const rotations = allCubeRotations();
+    const quaternions = rotations.map((matrix) =>
+      new THREE.Quaternion().setFromRotationMatrix(matrix),
+    );
+
+    interface PlacementPlan {
+      cubie: Cubie;
+      grid: THREE.Vector3;
+      quaternion: THREE.Quaternion;
+      /** Facelet indices this cubie's stickers occupy. */
+      indices: number[];
+    }
+    const plans: PlacementPlan[] = [];
+    const gridSeen = new Set<string>();
+    const indexSeen = new Set<number>();
+    for (const cubie of this.cubies) {
+      let match: {
+        grid: THREE.Vector3;
+        quaternion: THREE.Quaternion;
+        indices: number[];
+      } | null = null;
+
+      for (let r = 0; r < rotations.length && !match; r += 1) {
+        const grid = cubie.initialGrid.clone().applyMatrix4(rotations[r]);
+        snapToLattice(grid);
+        const indices: number[] = [];
+        let ok = true;
+        for (const sticker of cubie.stickers) {
+          const worldDir = snapToPrincipalAxis(
+            sticker.localNormal
+              .clone()
+              .applyQuaternion(quaternions[r]),
+          );
+          // A sticker must end up pointing OUTWARD from its new cell...
+          if (Math.round(worldDir.dot(grid)) !== 1) {
+            ok = false;
+            break;
+          }
+          // ...on a facelet whose color letter matches this sticker.
+          const index = faceletIndexOf(faceOfDirection(worldDir), grid);
+          if (facelets[index] !== COLOR_LETTER_BY_INDEX[sticker.colorIndex]) {
+            ok = false;
+            break;
+          }
+          indices.push(index);
+        }
+        if (ok) match = { grid, quaternion: quaternions[r], indices };
+      }
+
+      if (!match) return false; // unreachable state - reject wholesale
+
+      const gridKey = `${match.grid.x},${match.grid.y},${match.grid.z}`;
+      if (gridSeen.has(gridKey)) return false; // two cubies in one cell
+      gridSeen.add(gridKey);
+
+      // Every facelet may be claimed at most once; since the cube has exactly
+      // 54 stickers, "no duplicates" is equivalent to "full coverage".
+      for (const index of match.indices) {
+        if (indexSeen.has(index)) return false;
+        indexSeen.add(index);
+      }
+
+      plans.push({
+        cubie,
+        grid: match.grid,
+        quaternion: match.quaternion,
+        indices: match.indices,
+      });
+    }
+
+    if (indexSeen.size !== 54) return false; // defensive; implied by above
+
+    for (const plan of plans) {
+      plan.cubie.grid.copy(plan.grid);
+      plan.cubie.group.position.set(
+        plan.grid.x * CUBIE_SPACING,
+        plan.grid.y * CUBIE_SPACING,
+        plan.grid.z * CUBIE_SPACING,
+      );
+      plan.cubie.group.quaternion.copy(plan.quaternion);
+      plan.cubie.group.scale.set(1, 1, 1);
+      plan.cubie.group.updateMatrix();
+    }
+    return true;
   }
 
   /** Restore the pristine solved cube instantly (grid + transforms). */

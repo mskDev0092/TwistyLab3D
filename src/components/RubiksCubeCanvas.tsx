@@ -33,13 +33,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { PartyPopper, RotateCcw, Shuffle, Bot, ChevronDown } from "lucide-react";
+import { PartyPopper, RotateCcw, Shuffle } from "lucide-react";
 import { toast } from "sonner";
 
 import AiPlayPanel from "@/components/AiPlayPanel";
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
-import { FACE_MOVE_AXIS, type ParsedMove } from "@/lib/cubeNotation";
+import {
+  FACE_MOVE_AXIS,
+  buildAiPrompt,
+  isFaceletString,
+  moveToToken,
+  parseMoveSequence,
+  type ParsedMove,
+} from "@/lib/cubeNotation";
 import {
   Cubie,
   HALF_PI,
@@ -47,7 +54,9 @@ import {
   SliceMove,
   dominantAxis,
   snapToPrincipalAxis,
+  type PrincipalAxisName,
 } from "@/lib/RubiksCubeLogic";
+import { generateScramble } from "@/lib/scramble";
 
 /* ------------------------------- tuning ---------------------------------- */
 
@@ -58,10 +67,12 @@ const LOCK_THRESHOLD = 0.1;
 /** World units of pointer travel that correspond to a 90-degree turn. */
 const DRAG_QUARTER_DISTANCE = 2;
 const SNAP_DURATION_MS = 170;
-const SCRAMBLE_MOVES = 24;
+const SCRAMBLE_MOVES = 25;
 const SCRAMBLE_MOVE_MS = 115;
 /** Duration of one face turn executed from a pasted AI solution (watchable). */
 const RUN_MOVE_MS = 240;
+/** How many recent move tokens are kept for the AI prompt's HISTORY line. */
+const HISTORY_LIMIT = 80;
 
 /* -------------------------------- types ---------------------------------- */
 
@@ -80,6 +91,10 @@ interface DragContext {
   dragDir: THREE.Vector3 | null;
   /** Current slice angle in radians. */
   angle: number;
+  /** Committed slice identity, kept so the move can join the HISTORY log. */
+  axis: PrincipalAxisName;
+  layer: -1 | 0 | 1;
+  axisSign: 1 | -1;
 }
 
 interface TweenTask {
@@ -142,6 +157,7 @@ export default function RubiksCubeCanvas() {
   const busyRef = useRef(false);
   const scrambledRef = useRef(false);
   const disposedRef = useRef(false);
+  const historyRef = useRef<string[]>([]);
 
   const [moves, setMoves] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -149,12 +165,33 @@ export default function RubiksCubeCanvas() {
   const [cubeSolved, setCubeSolved] = useState(true);
   /** Live 54-char facelet state for the AI Play panel. */
   const [facelets, setFacelets] = useState("");
+  /** Recent face-turn tokens (oldest first) - feeds the prompt's HISTORY. */
+  const [history, setHistory] = useState<string[]>([]);
   /** Progress of a pasted-move run (AI Play panel button label). */
-  const [runProgress, setRunProgress] = useState<{ current: number; total: number } | null>(
-    null,
-  );
+  const [runProgress, setRunProgress] = useState<{
+    current: number;
+    total: number;
+    token: string;
+  } | null>(null);
+  /** Result of comparing the AI's STATE_AFTER prediction with reality. */
+  const [verify, setVerify] = useState<{ match: boolean } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
+
+  /** Record face-turn tokens for the AI prompt (bounded, oldest first). */
+  const appendHistory = useCallback((tokens: string[]): void => {
+    const list = historyRef.current;
+    list.push(...tokens);
+    if (list.length > HISTORY_LIMIT) {
+      list.splice(0, list.length - HISTORY_LIMIT);
+    }
+  }, []);
+
+  /** Push the current facelets + history snapshot into the AI Play panel. */
+  const publishState = useCallback((logic: RubiksCubeLogic): void => {
+    setFacelets(logic.getFaceletString());
+    setHistory([...historyRef.current]);
+  }, []);
 
   /** One animated, self-committing slice turn (used by the scramble queue). */
   const animateMove = useCallback(
@@ -173,9 +210,9 @@ export default function RubiksCubeCanvas() {
       if (disposedRef.current) return;
       logic.releaseSlice(move.quarterTurns);
       // Keep the AI Play panel in sync with the committed state.
-      setFacelets(logic.getFaceletString());
+      publishState(logic);
     },
-    [],
+    [publishState],
   );
 
   const handleScramble = useCallback(async () => {
@@ -184,35 +221,74 @@ export default function RubiksCubeCanvas() {
     busyRef.current = true;
     setBusy(true);
     setCubeSolved(false);
+    setVerify(null);
     scrambledRef.current = true;
     movesRef.current = 0;
     setMoves(0);
 
-    let previous: SliceMove | undefined;
-    for (let i = 0; i < SCRAMBLE_MOVES; i += 1) {
-      const move = RubiksCubeLogic.randomMove(previous);
-      previous = move;
-      await animateMove(move, SCRAMBLE_MOVE_MS);
+    // WCA-style scramble: crypto-random, constrained (no same face twice in
+    // a row / no same axis three in a row) and guaranteed different from the
+    // previous scramble of this session - the space is astronomically large.
+    const scramble = generateScramble(SCRAMBLE_MOVES);
+    historyRef.current = [];
+
+    for (const parsed of scramble) {
+      appendHistory([moveToToken(parsed)]);
+      const { axis, layer } = FACE_MOVE_AXIS[parsed.letter];
+      await animateMove(
+        { axis, layer, quarterTurns: parsed.quarterTurns },
+        SCRAMBLE_MOVE_MS,
+      );
       if (disposedRef.current) return;
     }
     busyRef.current = false;
     setBusy(false);
-  }, [animateMove]);
+  }, [animateMove, appendHistory]);
 
   const handleReset = useCallback(() => {
     const logic = logicRef.current;
     if (!logic || busyRef.current || logic.isSliceGrabbed) return;
     logic.reset();
     movesRef.current = 0;
+    historyRef.current = [];
     setMoves(0);
+    setVerify(null);
     scrambledRef.current = false;
     setCubeSolved(true);
-    setFacelets(logic.getFaceletString());
-  }, []);
+    publishState(logic);
+  }, [publishState]);
 
-  /** Execute moves parsed from a pasted AI reply (AI Play panel, step 2). */
+  /**
+   * Load a 54-char facelet state onto the physical cube (bot API / #state=
+   * URL). Physically unreachable strings are rejected without any change.
+   */
+  const handleLoadState = useCallback(
+    (raw: string): boolean => {
+      const logic = logicRef.current;
+      if (!logic || busyRef.current || logic.isSliceGrabbed) return false;
+      const value = raw.trim().toUpperCase();
+      if (!isFaceletString(value)) return false;
+      if (!logic.applyFacelets(value)) return false;
+
+      movesRef.current = 0;
+      historyRef.current = [];
+      setMoves(0);
+      setVerify(null);
+      scrambledRef.current = !logic.isSolved();
+      setCubeSolved(logic.isSolved());
+      publishState(logic);
+      return true;
+    },
+    [publishState],
+  );
+
+  /**
+   * Execute moves parsed from a pasted AI reply (AI Play panel, step 2).
+   * `predictedState` is the AI's optional STATE_AFTER facelet string - it is
+   * compared against the real result after the run and the verdict is shown.
+   */
   const executePastedMoves = useCallback(
-    async (movesToRun: ParsedMove[]) => {
+    async (movesToRun: ParsedMove[], predictedState?: string) => {
       const logic = logicRef.current;
       if (!logic || busyRef.current || logic.isSliceGrabbed) {
         toast.warning("The cube is busy", {
@@ -222,15 +298,14 @@ export default function RubiksCubeCanvas() {
       }
       busyRef.current = true;
       setBusy(true);
-      // Scroll back up so the user can watch the solution unfold live.
-      document
-        .getElementById("cube-section")
-        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      setVerify(null);
 
       const total = movesToRun.length;
       for (let index = 0; index < total; index += 1) {
         const move = movesToRun[index];
-        setRunProgress({ current: index + 1, total });
+        const token = moveToToken(move);
+        setRunProgress({ current: index + 1, total, token });
+        appendHistory([token]);
         const { axis, layer } = FACE_MOVE_AXIS[move.letter];
         await animateMove(
           { axis, layer, quarterTurns: move.quarterTurns },
@@ -255,13 +330,26 @@ export default function RubiksCubeCanvas() {
       } else {
         toast.success(`Executed ${total} move${total === 1 ? "" : "s"}.`);
       }
-    },
-    [animateMove],
-  );
 
-  const scrollToAiPanel = useCallback(() => {
-    document.getElementById("ai-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, []);
+      // Verify the AI's predicted end state (STATE_AFTER line), if provided.
+      const prediction = predictedState?.trim().toUpperCase();
+      if (prediction && isFaceletString(prediction)) {
+        const actual = logic.getFaceletString();
+        const match = prediction === actual;
+        setVerify({ match });
+        if (match) {
+          toast.success("STATE_AFTER matched the real cube ✓", {
+            description: "The AI correctly predicted the resulting state.",
+          });
+        } else {
+          toast.warning("STATE_AFTER differed from the real result", {
+            description: "The moves still executed - but the AI's prediction was off.",
+          });
+        }
+      }
+    },
+    [animateMove, appendHistory],
+  );
 
   useEffect(() => {
     const container = containerRef.current;
@@ -411,6 +499,9 @@ export default function RubiksCubeCanvas() {
         locked: false,
         dragDir: null,
         angle: 0,
+        axis: "x",
+        layer: 0,
+        axisSign: 1,
       };
     };
 
@@ -441,6 +532,9 @@ export default function RubiksCubeCanvas() {
         logic.grabSlice(axis, layer, sign);
         drag.locked = true;
         drag.dragDir = dragDir;
+        drag.axis = axis;
+        drag.layer = layer;
+        drag.axisSign = sign;
       }
 
       if (!drag.dragDir) return;
@@ -479,7 +573,36 @@ export default function RubiksCubeCanvas() {
         const nextMoves = movesRef.current + Math.abs(snappedTurns);
         movesRef.current = nextMoves;
         setMoves(nextMoves);
-        setFacelets(logic.getFaceletString());
+
+        // Log the drag as a face-turn token when it happened on an OUTER
+        // layer (middle-slice drags have no token in the Singmaster protocol).
+        // Convention: bare face move = clockwise = -1 quarter turn about the
+        // face's POSITIVE outward axis; the drag rotated about axisSign * axis.
+        if (drag.layer !== 0) {
+          const letter =
+            drag.axis === "x"
+              ? drag.layer === 1
+                ? "R"
+                : "L"
+              : drag.axis === "y"
+                ? drag.layer === 1
+                  ? "U"
+                  : "D"
+                : drag.layer === 1
+                  ? "F"
+                  : "B";
+          const eq = drag.axisSign * snappedTurns;
+          if (eq === -1 || eq === 1 || Math.abs(eq) === 2) {
+            appendHistory([
+              eq === -1
+                ? letter
+                : eq === 1
+                  ? `${letter}'`
+                  : `${letter}2`,
+            ]);
+          }
+        }
+        publishState(logic);
 
         const nowSolved = logic.isSolved();
         setCubeSolved(nowSolved);
@@ -542,7 +665,24 @@ export default function RubiksCubeCanvas() {
     // so React never gets a synchronous setState from the effect body).
     requestAnimationFrame(() => {
       setReady(true);
-      setFacelets(logic.getFaceletString());
+      publishState(logic);
+
+      // Open bot access: a 54-char facelet state can be pushed into the cube
+      // straight from the URL as #state=<facelets> (any AI/agent can deep-link
+      // a position without touching the UI).
+      const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+      const requested = (hashParams.get("state") ?? "").trim().toUpperCase();
+      if (isFaceletString(requested)) {
+        if (handleLoadState(requested)) {
+          toast.success("Cube state loaded from URL", {
+            description: "#state= accepted a valid, physically reachable cube.",
+          });
+        } else {
+          toast.warning("URL state rejected", {
+            description: "That #state= string is not a physically reachable cube.",
+          });
+        }
+      }
     });
 
     /* ----------------------- strict cleanup --------------------- */
@@ -565,123 +705,233 @@ export default function RubiksCubeCanvas() {
       logicRef.current = null;
       dragRef.current = null;
     };
-  }, []);
+  }, [appendHistory, handleLoadState, publishState]);
+
+  /* --------------------- open bot / AI access ------------------ */
+
+  /**
+   * window.RubiksCubeAPI - a stable, documented, UI-free control surface so
+   * ANY bot, agent or curious human can drive the cube from the console (or
+   * an automation harness): read the live state, get a paste-ready prompt,
+   * execute moves, load states via applyFacelets, scramble and reset.
+   * It is documented on-page (AI panel), in /llms.txt and /robots.txt.
+   */
+  useEffect(() => {
+    const api = {
+      version: "1.0.0",
+      protocol: "Remote-play protocol v2 - see getPrompt() or GET /llms.txt",
+      help: (): string =>
+        [
+          "window.RubiksCubeAPI — drive the 3D Rubik's Cube without the UI.",
+          "getFacelets(): 54-char Kociemba state string (faces U R F D L B).",
+          "getState(): { facelets, moveCount, isSolved, history, busy }.",
+          "getPrompt(): full copy-paste instructions + current state for any LLM.",
+          "isSolved() / getMoveCount() / getHistory().",
+          "applyMoves(\"R U R' U'\"): parse + execute face turns (Singmaster).",
+          "applyFacelets(\"<54 chars>\"): load a state (must be physically reachable).",
+          "scramble() / reset().",
+          "Notation: X = clockwise, X' = counter-clockwise, X2 = 180°, faces U R F D L B.",
+        ].join("\n"),
+      isReady: (): boolean => logicRef.current !== null && !disposedRef.current,
+      isSolved: (): boolean | null => logicRef.current?.isSolved() ?? null,
+      getMoveCount: (): number => movesRef.current,
+      getHistory: (): string[] => [...historyRef.current],
+      getFacelets: (): string | null =>
+        logicRef.current?.getFaceletString() ?? null,
+      getState: (): {
+        facelets: string | null;
+        moveCount: number;
+        isSolved: boolean | null;
+        history: string[];
+        busy: boolean;
+      } => ({
+        facelets: logicRef.current?.getFaceletString() ?? null,
+        moveCount: movesRef.current,
+        isSolved: logicRef.current?.isSolved() ?? null,
+        history: [...historyRef.current],
+        busy: busyRef.current,
+      }),
+      getPrompt: (): string | null => {
+        const logic = logicRef.current;
+        if (!logic) return null;
+        return buildAiPrompt({
+          facelets: logic.getFaceletString(),
+          moveCount: movesRef.current,
+          isSolved: logic.isSolved(),
+          history: [...historyRef.current],
+        });
+      },
+      applyMoves: (
+        sequence: string,
+      ): {
+        accepted: boolean;
+        reason?: string;
+        count?: number;
+        moves?: string[];
+        ignored?: string[];
+      } => {
+        if (!logicRef.current) return { accepted: false, reason: "not ready" };
+        if (busyRef.current) return { accepted: false, reason: "cube is busy" };
+        const { moves, ignored } = parseMoveSequence(String(sequence ?? ""));
+        if (moves.length === 0) {
+          return {
+            accepted: false,
+            reason: "no valid face moves found (use U R F D L B with ' and 2)",
+            ignored,
+          };
+        }
+        void executePastedMoves(moves);
+        return {
+          accepted: true,
+          count: moves.length,
+          moves: moves.map(moveToToken),
+          ignored,
+        };
+      },
+      applyFacelets: (
+        facelets: string,
+      ): { accepted: boolean; reason?: string } => {
+        if (!logicRef.current) return { accepted: false, reason: "not ready" };
+        if (busyRef.current) return { accepted: false, reason: "cube is busy" };
+        return handleLoadState(String(facelets ?? ""))
+          ? { accepted: true }
+          : { accepted: false, reason: "invalid or unreachable facelet string" };
+      },
+      scramble: (): { accepted: boolean; reason?: string } => {
+        if (busyRef.current) return { accepted: false, reason: "cube is busy" };
+        void handleScramble();
+        return { accepted: true };
+      },
+      reset: (): { accepted: boolean; reason?: string } => {
+        if (busyRef.current) return { accepted: false, reason: "cube is busy" };
+        handleReset();
+        return { accepted: true };
+      },
+    };
+
+    (window as unknown as Record<string, unknown>).RubiksCubeAPI = api;
+    return () => {
+      delete (window as unknown as Record<string, unknown>).RubiksCubeAPI;
+    };
+  }, [executePastedMoves, handleLoadState, handleScramble, handleReset]);
 
   /* --------------------------- HUD ---------------------------- */
 
   return (
-    <div className="flex min-h-dvh w-full flex-col bg-neutral-950 text-white">
-      {/* ============================== 3D cube ============================== */}
+    /*
+     * Single-screen "studio" layout - NO page scrolling anywhere:
+     *   desktop (lg+): AI Play panel pinned to the LEFT, cube fills the rest.
+     *   mobile:        cube on top (~52dvh), AI panel below, both visible at
+     *                  once; only the AI panel scrolls internally.
+     * DOM order stays [cube, panel] for accessibility; on desktop the row is
+     * visually reversed so the panel lands on the left.
+     */
+    <div className="flex h-dvh w-full flex-col overflow-hidden bg-neutral-950 text-white lg:flex-row-reverse">
+      {/* ========================= 3D cube (right) ========================= */}
       <section
         id="cube-section"
-        className="relative h-dvh w-full overflow-hidden bg-[radial-gradient(ellipse_at_center,#1d2233_0%,#0b0d13_58%,#05060a_100%)]"
+        className="relative min-h-0 min-w-0 w-full flex-1 basis-[52dvh] overflow-hidden bg-[radial-gradient(ellipse_at_center,#1d2233_0%,#0b0d13_58%,#05060a_100%)] lg:basis-auto"
       >
-      {/* Three.js mounts its <canvas> into this div */}
-      <div
-        ref={containerRef}
-        role="application"
-        aria-label="Interactive 3D Rubik's Cube. Drag a face to twist it, drag the background to orbit the camera."
-        className={`absolute inset-0 touch-none transition-opacity duration-700 ${
-          ready ? "opacity-100" : "opacity-0"
-        }`}
-      />
+        {/* Three.js mounts its <canvas> into this div */}
+        <div
+          ref={containerRef}
+          role="application"
+          aria-label="Interactive 3D Rubik's Cube. Drag a face to twist it, drag the background to orbit the camera."
+          className={`absolute inset-0 touch-none transition-opacity duration-700 ${
+            ready ? "opacity-100" : "opacity-0"
+          }`}
+        />
 
-      {/* Top bar */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 flex flex-wrap items-start justify-between gap-3 p-3 sm:p-5">
-        <div className="pointer-events-auto max-w-[16rem] rounded-2xl border border-white/10 bg-black/45 px-4 py-3 backdrop-blur-md sm:max-w-none">
-          <h1 className="text-sm font-semibold tracking-tight text-white sm:text-base">
-            Rubik&apos;s Cube{" "}
-            <span className="ml-1 align-middle text-[10px] font-normal uppercase tracking-[0.2em] text-white/40">
-              vanilla three.js
-            </span>
-          </h1>
-          <p className="mt-1 text-[11px] leading-snug text-white/55 sm:text-xs">
-            Drag a face to twist &middot; drag the background to orbit &middot;
-            scroll to zoom
-          </p>
-        </div>
-
-        <div className="pointer-events-auto flex items-center gap-2">
-          <div
-            aria-live="polite"
-            className="hidden rounded-full border border-white/10 bg-black/45 px-3.5 py-2 text-xs font-medium text-white/85 backdrop-blur-md sm:block"
-          >
-            Moves: {moves}
+        {/* Top bar */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-2 p-2.5 sm:p-4">
+          <div className="pointer-events-auto rounded-xl border border-white/10 bg-black/45 px-3 py-2 backdrop-blur-md">
+            <h1 className="text-xs font-semibold tracking-tight text-white sm:text-sm">
+              Rubik&apos;s Cube{" "}
+              <span className="ml-1 align-middle text-[9px] font-normal uppercase tracking-[0.2em] text-white/40">
+                vanilla three.js
+              </span>
+            </h1>
+            <p className="mt-0.5 hidden text-[11px] leading-snug text-white/55 sm:block">
+              Drag a face to twist &middot; drag the background to orbit
+              &middot; scroll to zoom
+            </p>
           </div>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => void handleScramble()}
-            disabled={busy}
-            className="h-10 min-w-[5.5rem] border-white/15 bg-white/10 text-white backdrop-blur-md hover:bg-white/20 hover:text-white"
-          >
-            <Shuffle className="size-4" /> Scramble
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={handleReset}
-            disabled={busy}
-            className="h-10 min-w-[5.5rem] border-white/15 bg-white/10 text-white backdrop-blur-md hover:bg-white/20 hover:text-white"
-          >
-            <RotateCcw className="size-4" /> Reset
-          </Button>
-        </div>
-      </div>
 
-      {/* Solved celebration */}
-      {cubeSolved && moves > 0 && (
-        <div className="pointer-events-none absolute inset-x-0 top-24 flex justify-center px-4">
-          <div className="flex items-center gap-2 rounded-full bg-emerald-500/90 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-500/25">
-            <PartyPopper className="size-4" aria-hidden />
-            Solved in {moves} moves!
+          <div className="pointer-events-auto flex items-center gap-1.5 sm:gap-2">
+            <div
+              aria-live="polite"
+              className="shrink-0 whitespace-nowrap rounded-full border border-white/10 bg-black/45 px-3 py-2 text-xs font-medium text-white/85 backdrop-blur-md"
+            >
+              Moves: {moves}
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void handleScramble()}
+              disabled={busy}
+              className="h-9 min-w-[5rem] border-white/15 bg-white/10 px-3 text-white backdrop-blur-md hover:bg-white/20 hover:text-white sm:h-10"
+            >
+              <Shuffle className="size-4" /> Scramble
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleReset}
+              disabled={busy}
+              className="h-9 min-w-[4.5rem] border-white/15 bg-white/10 px-3 text-white backdrop-blur-md hover:bg-white/20 hover:text-white sm:h-10"
+            >
+              <RotateCcw className="size-4" /> Reset
+            </Button>
           </div>
         </div>
-      )}
 
-      {/* AI Play shortcut + interaction hints */}
-      <div className="pointer-events-none absolute inset-x-0 bottom-4 flex flex-col items-center gap-2 px-4">
-        <button
-          type="button"
-          onClick={scrollToAiPanel}
-          className="pointer-events-auto flex min-h-10 items-center gap-2 rounded-full border border-white/15 bg-white/10 px-4 py-2 text-xs font-medium text-white backdrop-blur-md transition hover:bg-white/20"
-        >
-          <Bot className="size-4" aria-hidden />
-          AI Play — copy state, paste moves
-          <ChevronDown className="size-4" aria-hidden />
-        </button>
-        <p className="text-[10px] text-white/35 sm:text-[11px]">
+        {/* Solved celebration */}
+        {cubeSolved && moves > 0 && (
+          <div className="pointer-events-none absolute inset-x-0 top-16 flex justify-center px-4 sm:top-20">
+            <div className="flex items-center gap-2 rounded-full bg-emerald-500/90 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-500/25">
+              <PartyPopper className="size-4" aria-hidden />
+              Solved in {moves} moves!
+            </div>
+          </div>
+        )}
+
+        {/* Interaction hints */}
+        <p className="pointer-events-none absolute inset-x-0 bottom-3 text-center text-[10px] text-white/35 sm:text-[11px]">
           Drag a face to twist · drag the background to orbit · scroll to zoom
         </p>
-      </div>
 
-      {/* WebGL unavailable */}
-      {error && (
-        <div className="absolute inset-0 grid place-items-center p-6">
-          <div className="max-w-sm rounded-2xl border border-red-500/30 bg-black/70 p-6 text-center backdrop-blur-md">
-            <p className="text-sm font-semibold text-red-300">
-              3D rendering unavailable
-            </p>
-            <p className="mt-2 text-xs leading-relaxed text-white/70">{error}</p>
+        {/* WebGL unavailable */}
+        {error && (
+          <div className="absolute inset-0 grid place-items-center p-6">
+            <div className="max-w-sm rounded-2xl border border-red-500/30 bg-black/70 p-6 text-center backdrop-blur-md">
+              <p className="text-sm font-semibold text-red-300">
+                3D rendering unavailable
+              </p>
+              <p className="mt-2 text-xs leading-relaxed text-white/70">{error}</p>
+            </div>
           </div>
-        </div>
-      )}
-
+        )}
       </section>
 
-      {/* ============================ AI play area =========================== */}
-      <AiPlayPanel
-        facelets={facelets}
-        moveCount={moves}
-        isSolved={cubeSolved}
-        busy={busy}
-        runProgress={runProgress}
-        onRunMoves={(panelMoves) => void executePastedMoves(panelMoves)}
-      />
-
-      <footer className="mt-auto border-t border-white/5 py-6 text-center text-[11px] text-white/35">
-        Vanilla Three.js · Next.js App Router · static-export ready
-      </footer>
+      {/* ===================== AI play panel (left) ===================== */}
+      <aside
+        id="ai-panel"
+        aria-label="AI play panel: copy cube state, paste moves"
+        className="flex min-h-0 w-full flex-1 flex-col border-t border-white/10 bg-neutral-950 lg:h-dvh lg:w-[26rem] lg:flex-none lg:border-r lg:border-t-0 xl:w-[28rem]"
+      >
+        <AiPlayPanel
+          facelets={facelets}
+          moveCount={moves}
+          isSolved={cubeSolved}
+          busy={busy}
+          history={history}
+          runProgress={runProgress}
+          verify={verify}
+          onRunMoves={(panelMoves, predictedState) =>
+            void executePastedMoves(panelMoves, predictedState)
+          }
+        />
+      </aside>
 
       <Toaster position="top-center" richColors closeButton />
     </div>

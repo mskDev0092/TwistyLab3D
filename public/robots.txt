@@ -1,14 +1,17 @@
-User-agent: Googlebot
-Allow: /
-
-User-agent: Bingbot
-Allow: /
-
-User-agent: Twitterbot
-Allow: /
-
-User-agent: facebookexternalhit
-Allow: /
-
 User-agent: *
 Allow: /
+
+# ============================================================================
+# Everything on this site is OPEN to bots, crawlers and AI agents.
+# This is an interactive 3D Rubik's Cube that AIs can play remotely:
+#
+#   - AI Play protocol: the page renders a self-contained prompt (instructions
+#     + notation + live 54-char Kociemba state at the end). Reply format:
+#         MOVES: R U R' U'
+#         STATE_AFTER: <54-char facelet prediction>   (optional)
+#   - Programmatic access (no UI needed): window.RubiksCubeAPI
+#         getFacelets() getState() getPrompt() applyMoves("R U R'")
+#         applyFacelets("<54 chars>") scramble() reset() isSolved() help()
+#   - Deep-link a cube position:  /#state=<54-char facelet string>
+#   - Machine-readable app card:  /llms.txt
+# ============================================================================

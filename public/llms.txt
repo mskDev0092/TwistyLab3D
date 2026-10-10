@@ -1,0 +1,54 @@
+# Rubik's Cube — AI-playable 3D puzzle (vanilla Three.js + Next.js)
+
+> An interactive 3D Rubik's Cube that any AI, bot, agent or solver can play.
+> No login, no API key, no rate limit. Static site — everything runs client-side.
+
+## Play it (human route)
+
+Open the site. The AI Play panel (left column) has two steps:
+
+1. **Copy** — one click copies a self-contained prompt: response contract,
+   Singmaster notation, color legend, session notes, and the CURRENT CUBE
+   STATE as the last block (54-char Kociemba string + unfolded net + history).
+2. **Paste** — drop the AI's reply into step 2 and press Run. The cube
+   executes every move with animation; the move counter updates per quarter
+   turn; an optional `STATE_AFTER:` prediction is auto-verified.
+
+## Reply format expected from AIs (protocol v2)
+
+```
+MOVES: R U R' U' F2 D L' B2
+STATE_AFTER: <54-char facelet string predicted after the moves>   (optional)
+```
+
+- Faces are fixed in space: U = up, D = down, F = front, B = back, R = right, L = left.
+- `X` = 90° clockwise viewed from outside that face; `X'` = counter-clockwise; `X2` = 180°.
+- Only the six face turns U R F D L B are supported (no x/y/z, wide, or M/E/S moves).
+- If already solved, reply exactly: `Already solved`
+
+## State format (Kociemba facelets)
+
+- 54 characters, faces in order **U R F D L B**, 9 chars each.
+- Each face is read row-major (left→right, top→bottom) as seen from OUTSIDE that face.
+- Solved cube: `UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB`
+- Color scheme: U = White, R = Red, F = Green, D = Yellow, L = Orange, B = Blue.
+
+## Drive it headless (console / script / agent)
+
+`window.RubiksCubeAPI` is exposed on every page load:
+
+| Method | Result |
+| --- | --- |
+| `getFacelets()` | live 54-char state string |
+| `getState()` | `{ facelets, moveCount, isSolved, history, busy }` |
+| `getPrompt()` | the full paste-ready AI prompt (state at the end) |
+| `applyMoves("R U R'")` | parse + execute a sequence (accepts prose) |
+| `applyFacelets("<54>")` | load a state (rejects unreachable ones) |
+| `scramble()` / `reset()` | 25-move WCA-style scramble / solved state |
+| `isSolved()` / `getMoveCount()` / `getHistory()` | quick queries |
+| `help()` | the same list, in the console |
+
+## Deep links
+
+Append `#state=<54-char facelet string>` to the URL to boot the cube into
+that position directly (physically unreachable strings are rejected).

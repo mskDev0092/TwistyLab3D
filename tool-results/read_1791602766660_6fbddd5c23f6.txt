@@ -1,0 +1,690 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * RubiksCubeCanvas
+     5→ * ================
+     6→ * The ONLY place where Three.js touches the DOM. This component is never
+     7→ * server-rendered: `RubiksCubeWrapper` loads it through `next/dynamic` with
+     8→ * `{ ssr: false }`, so `window` / `document` are guaranteed to exist.
+     9→ *
+    10→ * Everything (renderer, scene, camera, controls, event listeners, animation
+    11→ * frames) is created inside a single `useEffect` and destroyed in its cleanup
+    12→ * function, which makes hot-reloading and route changes leak-free.
+    13→ *
+    14→ * Interaction model
+    15→ * -----------------
+    16→ * - Pointer down on the BACKGROUND -> OrbitControls orbits the camera.
+    17→ * - Pointer down on a CUBIE        -> we take over the gesture:
+    18→ *     1. Raycast to find the cubie + the exact face that was clicked.
+    19→ *     2. Build a fixed "drag plane" through the hit point, perpendicular to
+    20→ *        the face normal. Every pointer position is projected onto this
+    21→ *        plane, which turns 2D mouse movement into stable 3D movement.
+    22→ *     3. Once the pointer moves past a small threshold, the drag direction is
+    23→ *        snapped to the nearest principal axis lying in the face plane. The
+    24→ *        rotation axis is `faceNormal x dragDir` - for perpendicular principal
+    25→ *        axes the cross product is exactly the third principal axis, so no
+    26→ *        error can creep in.
+    27→ *     4. The 9-cubie slice around that axis is re-parented under a temporary
+    28→ *        pivot group (see RubiksCubeLogic) and follows the pointer 1:1.
+    29→ *     5. On release the angle snaps to the nearest multiple of 90 deg with a
+    30→ *        short tween, then the logical grid state is committed.
+    31→ */
+    32→
+    33→import { useCallback, useEffect, useRef, useState } from "react";
+    34→import * as THREE from "three";
+    35→import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+    36→import { PartyPopper, RotateCcw, Shuffle, Bot, ChevronDown } from "lucide-react";
+    37→import { toast } from "sonner";
+    38→
+    39→import AiPlayPanel from "@/components/AiPlayPanel";
+    40→import { Button } from "@/components/ui/button";
+    41→import { Toaster } from "@/components/ui/sonner";
+    42→import { FACE_MOVE_AXIS, type ParsedMove } from "@/lib/cubeNotation";
+    43→import {
+    44→  Cubie,
+    45→  HALF_PI,
+    46→  RubiksCubeLogic,
+    47→  SliceMove,
+    48→  dominantAxis,
+    49→  snapToPrincipalAxis,
+    50→} from "@/lib/RubiksCubeLogic";
+    51→
+    52→/* ------------------------------- tuning ---------------------------------- */
+    53→
+    54→const CAMERA_FOV = 36;
+    55→const CAMERA_POSITION = new THREE.Vector3(5.4, 4.8, 6.4);
+    56→/** World-space pointer travel before a drag commits to a rotation axis. */
+    57→const LOCK_THRESHOLD = 0.1;
+    58→/** World units of pointer travel that correspond to a 90-degree turn. */
+    59→const DRAG_QUARTER_DISTANCE = 2;
+    60→const SNAP_DURATION_MS = 170;
+    61→const SCRAMBLE_MOVES = 24;
+    62→const SCRAMBLE_MOVE_MS = 115;
+    63→/** Duration of one face turn executed from a pasted AI solution (watchable). */
+    64→const RUN_MOVE_MS = 240;
+    65→
+    66→/* -------------------------------- types ---------------------------------- */
+    67→
+    68→/** Everything needed to turn an in-progress pointer drag into a slice turn. */
+    69→interface DragContext {
+    70→  cubie: Cubie;
+    71→  /** Hit point on the cube; origin of the drag vector. */
+    72→  startPoint: THREE.Vector3;
+    73→  /** Plane through the hit point, perpendicular to the face normal. */
+    74→  plane: THREE.Plane;
+    75→  /** Snapped world-space face normal at pointer-down. */
+    76→  worldNormal: THREE.Vector3;
+    77→  /** True once the rotation axis has been chosen. */
+    78→  locked: boolean;
+    79→  /** Unit principal axis (in the face plane) the pointer is dragging along. */
+    80→  dragDir: THREE.Vector3 | null;
+    81→  /** Current slice angle in radians. */
+    82→  angle: number;
+    83→}
+    84→
+    85→interface TweenTask {
+    86→  from: number;
+    87→  to: number;
+    88→  duration: number;
+    89→  start: number;
+    90→  ease: (t: number) => number;
+    91→  onUpdate: (value: number) => void;
+    92→  resolve: () => void;
+    93→}
+    94→
+    95→/* ------------------------------- helpers --------------------------------- */
+    96→
+    97→const easeOutCubic = (t: number): number => 1 - Math.pow(1 - t, 3);
+    98→const easeInOutQuad = (t: number): number =>
+    99→  t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+   100→
+   101→/** Push a numeric tween onto `list`; the RAF loop advances and resolves it. */
+   102→function runTween(
+   103→  list: TweenTask[],
+   104→  from: number,
+   105→  to: number,
+   106→  duration: number,
+   107→  ease: (t: number) => number,
+   108→  onUpdate: (value: number) => void,
+   109→): Promise<void> {
+   110→  return new Promise<void>((resolve) => {
+   111→    list.push({
+   112→      from,
+   113→      to,
+   114→      duration,
+   115→      start: performance.now(),
+   116→      ease,
+   117→      onUpdate,
+   118→      resolve,
+   119→    });
+   120→  });
+   121→}
+   122→
+   123→/** The two unit principal axes perpendicular to a snapped face normal. */
+   124→function tangentAxes(normal: THREE.Vector3): [THREE.Vector3, THREE.Vector3] {
+   125→  if (normal.x !== 0) {
+   126→    return [new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1)];
+   127→  }
+   128→  if (normal.y !== 0) {
+   129→    return [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, 1)];
+   130→  }
+   131→  return [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0)];
+   132→}
+   133→
+   134→/* ------------------------------ component -------------------------------- */
+   135→
+   136→export default function RubiksCubeCanvas() {
+   137→  const containerRef = useRef<HTMLDivElement | null>(null);
+   138→  const logicRef = useRef<RubiksCubeLogic | null>(null);
+   139→  const dragRef = useRef<DragContext | null>(null);
+   140→  const tweensRef = useRef<TweenTask[]>([]);
+   141→  const movesRef = useRef(0);
+   142→  const busyRef = useRef(false);
+   143→  const scrambledRef = useRef(false);
+   144→  const disposedRef = useRef(false);
+   145→
+   146→  const [moves, setMoves] = useState(0);
+   147→  const [busy, setBusy] = useState(false);
+   148→  /** Actual solved-ness of the cube (drives the banner AND the AI panel). */
+   149→  const [cubeSolved, setCubeSolved] = useState(true);
+   150→  /** Live 54-char facelet state for the AI Play panel. */
+   151→  const [facelets, setFacelets] = useState("");
+   152→  /** Progress of a pasted-move run (AI Play panel button label). */
+   153→  const [runProgress, setRunProgress] = useState<{ current: number; total: number } | null>(
+   154→    null,
+   155→  );
+   156→  const [error, setError] = useState<string | null>(null);
+   157→  const [ready, setReady] = useState(false);
+   158→
+   159→  /** One animated, self-committing slice turn (used by the scramble queue). */
+   160→  const animateMove = useCallback(
+   161→    async (move: SliceMove, duration: number): Promise<void> => {
+   162→      const logic = logicRef.current;
+   163→      if (!logic) return;
+   164→      logic.grabSlice(move.axis, move.layer, 1);
+   165→      await runTween(
+   166→        tweensRef.current,
+   167→        0,
+   168→        move.quarterTurns * HALF_PI,
+   169→        duration,
+   170→        easeInOutQuad,
+   171→        (value) => logic.rotateSliceTo(value),
+   172→      );
+   173→      if (disposedRef.current) return;
+   174→      logic.releaseSlice(move.quarterTurns);
+   175→      // Keep the AI Play panel in sync with the committed state.
+   176→      setFacelets(logic.getFaceletString());
+   177→    },
+   178→    [],
+   179→  );
+   180→
+   181→  const handleScramble = useCallback(async () => {
+   182→    const logic = logicRef.current;
+   183→    if (!logic || busyRef.current || logic.isSliceGrabbed) return;
+   184→    busyRef.current = true;
+   185→    setBusy(true);
+   186→    setCubeSolved(false);
+   187→    scrambledRef.current = true;
+   188→    movesRef.current = 0;
+   189→    setMoves(0);
+   190→
+   191→    let previous: SliceMove | undefined;
+   192→    for (let i = 0; i < SCRAMBLE_MOVES; i += 1) {
+   193→      const move = RubiksCubeLogic.randomMove(previous);
+   194→      previous = move;
+   195→      await animateMove(move, SCRAMBLE_MOVE_MS);
+   196→      if (disposedRef.current) return;
+   197→    }
+   198→    busyRef.current = false;
+   199→    setBusy(false);
+   200→  }, [animateMove]);
+   201→
+   202→  const handleReset = useCallback(() => {
+   203→    const logic = logicRef.current;
+   204→    if (!logic || busyRef.current || logic.isSliceGrabbed) return;
+   205→    logic.reset();
+   206→    movesRef.current = 0;
+   207→    setMoves(0);
+   208→    scrambledRef.current = false;
+   209→    setCubeSolved(true);
+   210→    setFacelets(logic.getFaceletString());
+   211→  }, []);
+   212→
+   213→  /** Execute moves parsed from a pasted AI reply (AI Play panel, step 2). */
+   214→  const executePastedMoves = useCallback(
+   215→    async (movesToRun: ParsedMove[]) => {
+   216→      const logic = logicRef.current;
+   217→      if (!logic || busyRef.current || logic.isSliceGrabbed) {
+   218→        toast.warning("The cube is busy", {
+   219→          description: "Wait for the current animation to finish, then try again.",
+   220→        });
+   221→        return;
+   222→      }
+   223→      busyRef.current = true;
+   224→      setBusy(true);
+   225→      // Scroll back up so the user can watch the solution unfold live.
+   226→      document
+   227→        .getElementById("cube-section")
+   228→        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+   229→
+   230→      const total = movesToRun.length;
+   231→      for (let index = 0; index < total; index += 1) {
+   232→        const move = movesToRun[index];
+   233→        setRunProgress({ current: index + 1, total });
+   234→        const { axis, layer } = FACE_MOVE_AXIS[move.letter];
+   235→        await animateMove(
+   236→          { axis, layer, quarterTurns: move.quarterTurns },
+   237→          RUN_MOVE_MS,
+   238→        );
+   239→        if (disposedRef.current) return;
+   240→        const nextMoves = movesRef.current + Math.abs(move.quarterTurns);
+   241→        movesRef.current = nextMoves;
+   242→        setMoves(nextMoves);
+   243→      }
+   244→      setRunProgress(null);
+   245→      busyRef.current = false;
+   246→      setBusy(false);
+   247→
+   248→      const nowSolved = logic.isSolved();
+   249→      setCubeSolved(nowSolved);
+   250→      if (nowSolved && scrambledRef.current) {
+   251→        scrambledRef.current = false;
+   252→        toast.success(`Cube solved in ${movesRef.current} moves!`, {
+   253→          description: "The pasted moves did it — scramble again for another round.",
+   254→        });
+   255→      } else {
+   256→        toast.success(`Executed ${total} move${total === 1 ? "" : "s"}.`);
+   257→      }
+   258→    },
+   259→    [animateMove],
+   260→  );
+   261→
+   262→  const scrollToAiPanel = useCallback(() => {
+   263→    document.getElementById("ai-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+   264→  }, []);
+   265→
+   266→  useEffect(() => {
+   267→    const container = containerRef.current;
+   268→    if (!container) return;
+   269→    disposedRef.current = false;
+   270→
+   271→    /* ------------------------- renderer ------------------------- */
+   272→    let renderer: THREE.WebGLRenderer;
+   273→    try {
+   274→      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+   275→    } catch {
+   276→      // Deferred to a microtask: React forbids synchronous setState inside an
+   277→      // effect body (react-hooks/set-state-in-effect).
+   278→      void Promise.resolve().then(() => {
+   279→        setError(
+   280→          "WebGL is not available in this browser, so the 3D cube cannot be displayed.",
+   281→        );
+   282→      });
+   283→      return;
+   284→    }
+   285→    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+   286→    renderer.setSize(container.clientWidth, Math.max(1, container.clientHeight));
+   287→    renderer.shadowMap.enabled = true;
+   288→    // NOTE: PCFSoftShadowMap was removed in recent three.js versions;
+   289→    // PCFShadowMap is the supported soft-quality option in r18x.
+   290→    renderer.shadowMap.type = THREE.PCFShadowMap;
+   291→    renderer.setClearColor(0x000000, 0); // transparent - CSS gradient shows through
+   292→    const canvas = renderer.domElement;
+   293→    canvas.style.display = "block";
+   294→    canvas.style.touchAction = "none";
+   295→    canvas.style.cursor = "grab";
+   296→    container.appendChild(canvas);
+   297→
+   298→    /* --------------------- scene & camera ----------------------- */
+   299→    const scene = new THREE.Scene();
+   300→    const camera = new THREE.PerspectiveCamera(
+   301→      CAMERA_FOV,
+   302→      container.clientWidth / Math.max(1, container.clientHeight),
+   303→      0.1,
+   304→      100,
+   305→    );
+   306→    camera.position.copy(CAMERA_POSITION);
+   307→
+   308→    /* --------------------- cube (pure logic) -------------------- */
+   309→    const logic = new RubiksCubeLogic();
+   310→    logicRef.current = logic;
+   311→    scene.add(logic.root);
+   312→
+   313→    /* ----------------------- controls --------------------------- */
+   314→    const controls = new OrbitControls(camera, canvas);
+   315→    controls.enableDamping = true;
+   316→    controls.dampingFactor = 0.08;
+   317→    controls.enablePan = false;
+   318→    controls.minDistance = 5;
+   319→    controls.maxDistance = 16;
+   320→    controls.rotateSpeed = 0.85;
+   321→    controls.autoRotate = true; // gentle idle spin until the first click
+   322→    controls.autoRotateSpeed = 1.1;
+   323→    controls.target.set(0, 0, 0);
+   324→
+   325→    /* ------------------------ lighting -------------------------- */
+   326→    const ambient = new THREE.AmbientLight(0xffffff, 0.9);
+   327→    const keyLight = new THREE.DirectionalLight(0xffffff, 2.1);
+   328→    keyLight.position.set(6, 10, 7);
+   329→    keyLight.castShadow = true;
+   330→    keyLight.shadow.mapSize.set(2048, 2048);
+   331→    keyLight.shadow.camera.near = 2;
+   332→    keyLight.shadow.camera.far = 30;
+   333→    keyLight.shadow.camera.left = -7;
+   334→    keyLight.shadow.camera.right = 7;
+   335→    keyLight.shadow.camera.top = 7;
+   336→    keyLight.shadow.camera.bottom = -7;
+   337→    keyLight.shadow.bias = -0.0004;
+   338→    keyLight.shadow.normalBias = 0.02;
+   339→    const fillLight = new THREE.DirectionalLight(0xffffff, 0.55);
+   340→    fillLight.position.set(-7, 3, -6);
+   341→    scene.add(ambient, keyLight, fillLight);
+   342→
+   343→    /* -------------------- shadow catcher ------------------------ */
+   344→    const groundGeometry = new THREE.PlaneGeometry(50, 50);
+   345→    const groundMaterial = new THREE.ShadowMaterial({ opacity: 0.3 });
+   346→    const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+   347→    ground.rotation.x = -HALF_PI;
+   348→    ground.position.y = -3.1;
+   349→    ground.receiveShadow = true;
+   350→    scene.add(ground);
+   351→
+   352→    /* ------------------- picking / dragging --------------------- */
+   353→    const pointer = new THREE.Vector2();
+   354→    const raycaster = new THREE.Raycaster();
+   355→
+   356→    const setPointerFromEvent = (event: PointerEvent): void => {
+   357→      const rect = container.getBoundingClientRect();
+   358→      pointer.set(
+   359→        ((event.clientX - rect.left) / rect.width) * 2 - 1,
+   360→        -((event.clientY - rect.top) / rect.height) * 2 + 1,
+   361→      );
+   362→      raycaster.setFromCamera(pointer, camera);
+   363→    };
+   364→
+   365→    /** Raycast against every cubie body + sticker. */
+   366→    const pickCubie = (
+   367→      event: PointerEvent,
+   368→    ): { cubie: Cubie; point: THREE.Vector3; worldNormal: THREE.Vector3 } | null => {
+   369→      setPointerFromEvent(event);
+   370→      const hit = raycaster.intersectObjects(logic.pickables, false)[0];
+   371→      if (!hit || !hit.face) return null;
+   372→      const userData = hit.object.userData as {
+   373→        cubie?: Cubie;
+   374→        localNormal?: THREE.Vector3;
+   375→      };
+   376→      const cubie = userData.cubie;
+   377→      if (!cubie) return null;
+   378→
+   379→      // Stickers know their exact outward normal; for hits on the black
+   380→      // plastic body we derive it from the triangle normal instead.
+   381→      const worldNormal = snapToPrincipalAxis(
+   382→        userData.localNormal
+   383→          ? userData.localNormal
+   384→              .clone()
+   385→              .applyQuaternion(cubie.group.quaternion)
+   386→          : hit.face.normal.clone().transformDirection(hit.object.matrixWorld),
+   387→      );
+   388→      return { cubie, point: hit.point.clone(), worldNormal };
+   389→    };
+   390→
+   391→    const onPointerDown = (event: PointerEvent): void => {
+   392→      if (event.target !== canvas) return; // HUD clicks never reach the cube
+   393→      controls.autoRotate = false;
+   394→      // Never start a new slice while the previous snap tween is settling,
+   395→      // otherwise two pivots would fight over the same cubies.
+   396→      if (busyRef.current || tweensRef.current.length > 0) return;
+   397→
+   398→      const hit = pickCubie(event);
+   399→      if (!hit) return; // background -> OrbitControls keeps the gesture
+   400→
+   401→      controls.enabled = false; // freeze camera orbit for this gesture
+   402→      canvas.style.cursor = "grabbing";
+   403→      dragRef.current = {
+   404→        cubie: hit.cubie,
+   405→        startPoint: hit.point,
+   406→        plane: new THREE.Plane().setFromNormalAndCoplanarPoint(
+   407→          hit.worldNormal,
+   408→          hit.point,
+   409→        ),
+   410→        worldNormal: hit.worldNormal,
+   411→        locked: false,
+   412→        dragDir: null,
+   413→        angle: 0,
+   414→      };
+   415→    };
+   416→
+   417→    const onPointerMove = (event: PointerEvent): void => {
+   418→      const drag = dragRef.current;
+   419→      if (!drag) return;
+   420→      setPointerFromEvent(event);
+   421→
+   422→      const current = new THREE.Vector3();
+   423→      if (raycaster.ray.intersectPlane(drag.plane, current) === null) return;
+   424→      const dragVector = current.sub(drag.startPoint);
+   425→
+   426→      if (!drag.locked) {
+   427→        if (dragVector.length() < LOCK_THRESHOLD) return;
+   428→
+   429→        // Choose the in-plane principal axis that best matches the pointer
+   430→        // movement, signed so it points the way the pointer travels.
+   431→        const [t1, t2] = tangentAxes(drag.worldNormal);
+   432→        const t = Math.abs(dragVector.dot(t1)) >= Math.abs(dragVector.dot(t2)) ? t1 : t2;
+   433→        const dragDir = t.clone().multiplyScalar(Math.sign(dragVector.dot(t)) || 1);
+   434→
+   435→        // axis = faceNormal x dragDir. Both are perpendicular principal axes,
+   436→        // so the result is EXACTLY +/- the third principal axis.
+   437→        const axisVector = new THREE.Vector3().crossVectors(drag.worldNormal, dragDir);
+   438→        const { axis, sign } = dominantAxis(axisVector);
+   439→        const layer = Math.round(drag.cubie.grid[axis]) as -1 | 0 | 1;
+   440→
+   441→        logic.grabSlice(axis, layer, sign);
+   442→        drag.locked = true;
+   443→        drag.dragDir = dragDir;
+   444→      }
+   445→
+   446→      if (!drag.dragDir) return;
+   447→      const angle = THREE.MathUtils.clamp(
+   448→        dragVector.dot(drag.dragDir) * (HALF_PI / DRAG_QUARTER_DISTANCE),
+   449→        -Math.PI,
+   450→        Math.PI,
+   451→      );
+   452→      drag.angle = angle;
+   453→      logic.rotateSliceTo(angle);
+   454→    };
+   455→
+   456→    const onPointerUp = (): void => {
+   457→      const drag = dragRef.current;
+   458→      if (!drag) return;
+   459→      dragRef.current = null;
+   460→      controls.enabled = true;
+   461→      canvas.style.cursor = "grab";
+   462→      if (!drag.locked || !drag.dragDir) return; // plain click, no twist
+   463→
+   464→      // Snap the slice to the nearest quarter-turn and commit it.
+   465→      const snappedTurns = Math.round(drag.angle / HALF_PI);
+   466→      const target = snappedTurns * HALF_PI;
+   467→      void runTween(
+   468→        tweensRef.current,
+   469→        drag.angle,
+   470→        target,
+   471→        SNAP_DURATION_MS,
+   472→        easeOutCubic,
+   473→        (value) => logic.rotateSliceTo(value),
+   474→      ).then(() => {
+   475→        if (disposedRef.current) return;
+   476→        logic.releaseSlice(snappedTurns);
+   477→        if (snappedTurns === 0) return;
+   478→
+   479→        const nextMoves = movesRef.current + Math.abs(snappedTurns);
+   480→        movesRef.current = nextMoves;
+   481→        setMoves(nextMoves);
+   482→        setFacelets(logic.getFaceletString());
+   483→
+   484→        const nowSolved = logic.isSolved();
+   485→        setCubeSolved(nowSolved);
+   486→        if (nowSolved && scrambledRef.current) {
+   487→          scrambledRef.current = false;
+   488→          toast.success(`Cube solved in ${nextMoves} moves!`, {
+   489→            description: "Scramble again to keep the challenge going.",
+   490→          });
+   491→        }
+   492→      });
+   493→    };
+   494→
+   495→    // Capture phase on the container: runs BEFORE OrbitControls' own
+   496→    // pointerdown handler on the canvas, so we can disable orbiting first.
+   497→    container.addEventListener("pointerdown", onPointerDown, true);
+   498→    window.addEventListener("pointermove", onPointerMove);
+   499→    window.addEventListener("pointerup", onPointerUp);
+   500→    window.addEventListener("pointercancel", onPointerUp);
+   501→
+   502→    /* ------------------- resize & render loop ------------------- */
+   503→    const resize = (): void => {
+   504→      const width = container.clientWidth;
+   505→      const height = Math.max(1, container.clientHeight);
+   506→      camera.aspect = width / height;
+   507→      // Portrait / narrow screens: zoom out proportionally so the whole cube
+   508→      // still fits horizontally (OrbitControls dollies the POSITION, so this
+   509→      // zoom factor never fights with the user's scroll / pinch zoom).
+   510→      camera.zoom = Math.min(1, 1.36 * camera.aspect);
+   511→      camera.updateProjectionMatrix();
+   512→      renderer.setSize(width, height);
+   513→    };
+   514→    const observer = new ResizeObserver(resize);
+   515→    observer.observe(container);
+   516→
+   517→    const stepTweens = (now: number): void => {
+   518→      const tasks = tweensRef.current;
+   519→      for (let i = tasks.length - 1; i >= 0; i -= 1) {
+   520→        const task = tasks[i];
+   521→        const progress = Math.min(
+   522→          1,
+   523→          (now - task.start) / Math.max(1, task.duration),
+   524→        );
+   525→        task.onUpdate(task.from + (task.to - task.from) * task.ease(progress));
+   526→        if (progress >= 1) {
+   527→          tasks.splice(i, 1);
+   528→          task.resolve();
+   529→        }
+   530→      }
+   531→    };
+   532→
+   533→    let frameId = 0;
+   534→    const tick = (now: number): void => {
+   535→      frameId = requestAnimationFrame(tick);
+   536→      stepTweens(now);
+   537→      controls.update();
+   538→      renderer.render(scene, camera);
+   539→    };
+   540→    frameId = requestAnimationFrame(tick);
+   541→    // Fade the canvas in once rendering has actually started (async callback,
+   542→    // so React never gets a synchronous setState from the effect body).
+   543→    requestAnimationFrame(() => {
+   544→      setReady(true);
+   545→      setFacelets(logic.getFaceletString());
+   546→    });
+   547→
+   548→    /* ----------------------- strict cleanup --------------------- */
+   549→    return () => {
+   550→      disposedRef.current = true;
+   551→      cancelAnimationFrame(frameId);
+   552→      tweensRef.current.length = 0;
+   553→      observer.disconnect();
+   554→      container.removeEventListener("pointerdown", onPointerDown, true);
+   555→      window.removeEventListener("pointermove", onPointerMove);
+   556→      window.removeEventListener("pointerup", onPointerUp);
+   557→      window.removeEventListener("pointercancel", onPointerUp);
+   558→      controls.dispose();
+   559→      logic.dispose(); // frees cube geometries/materials, detaches the root
+   560→      groundGeometry.dispose();
+   561→      groundMaterial.dispose();
+   562→      scene.clear();
+   563→      renderer.dispose(); // frees the WebGL context and its GPU programs
+   564→      canvas.remove(); // detaches the <canvas> from the DOM
+   565→      logicRef.current = null;
+   566→      dragRef.current = null;
+   567→    };
+   568→  }, []);
+   569→
+   570→  /* --------------------------- HUD ---------------------------- */
+   571→
+   572→  return (
+   573→    <div className="flex min-h-dvh w-full flex-col bg-neutral-950 text-white">
+   574→      {/* ============================== 3D cube ============================== */}
+   575→      <section
+   576→        id="cube-section"
+   577→        className="relative h-dvh w-full overflow-hidden bg-[radial-gradient(ellipse_at_center,#1d2233_0%,#0b0d13_58%,#05060a_100%)]"
+   578→      >
+   579→      {/* Three.js mounts its <canvas> into this div */}
+   580→      <div
+   581→        ref={containerRef}
+   582→        role="application"
+   583→        aria-label="Interactive 3D Rubik's Cube. Drag a face to twist it, drag the background to orbit the camera."
+   584→        className={`absolute inset-0 touch-none transition-opacity duration-700 ${
+   585→          ready ? "opacity-100" : "opacity-0"
+   586→        }`}
+   587→      />
+   588→
+   589→      {/* Top bar */}
+   590→      <div className="pointer-events-none absolute inset-x-0 top-0 flex flex-wrap items-start justify-between gap-3 p-3 sm:p-5">
+   591→        <div className="pointer-events-auto max-w-[16rem] rounded-2xl border border-white/10 bg-black/45 px-4 py-3 backdrop-blur-md sm:max-w-none">
+   592→          <h1 className="text-sm font-semibold tracking-tight text-white sm:text-base">
+   593→            Rubik&apos;s Cube{" "}
+   594→            <span className="ml-1 align-middle text-[10px] font-normal uppercase tracking-[0.2em] text-white/40">
+   595→              vanilla three.js
+   596→            </span>
+   597→          </h1>
+   598→          <p className="mt-1 text-[11px] leading-snug text-white/55 sm:text-xs">
+   599→            Drag a face to twist &middot; drag the background to orbit &middot;
+   600→            scroll to zoom
+   601→          </p>
+   602→        </div>
+   603→
+   604→        <div className="pointer-events-auto flex items-center gap-2">
+   605→          <div
+   606→            aria-live="polite"
+   607→            className="hidden rounded-full border border-white/10 bg-black/45 px-3.5 py-2 text-xs font-medium text-white/85 backdrop-blur-md sm:block"
+   608→          >
+   609→            Moves: {moves}
+   610→          </div>
+   611→          <Button
+   612→            size="sm"
+   613→            variant="outline"
+   614→            onClick={() => void handleScramble()}
+   615→            disabled={busy}
+   616→            className="h-10 min-w-[5.5rem] border-white/15 bg-white/10 text-white backdrop-blur-md hover:bg-white/20 hover:text-white"
+   617→          >
+   618→            <Shuffle className="size-4" /> Scramble
+   619→          </Button>
+   620→          <Button
+   621→            size="sm"
+   622→            variant="outline"
+   623→            onClick={handleReset}
+   624→            disabled={busy}
+   625→            className="h-10 min-w-[5.5rem] border-white/15 bg-white/10 text-white backdrop-blur-md hover:bg-white/20 hover:text-white"
+   626→          >
+   627→            <RotateCcw className="size-4" /> Reset
+   628→          </Button>
+   629→        </div>
+   630→      </div>
+   631→
+   632→      {/* Solved celebration */}
+   633→      {cubeSolved && moves > 0 && (
+   634→        <div className="pointer-events-none absolute inset-x-0 top-24 flex justify-center px-4">
+   635→          <div className="flex items-center gap-2 rounded-full bg-emerald-500/90 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-500/25">
+   636→            <PartyPopper className="size-4" aria-hidden />
+   637→            Solved in {moves} moves!
+   638→          </div>
+   639→        </div>
+   640→      )}
+   641→
+   642→      {/* AI Play shortcut + interaction hints */}
+   643→      <div className="pointer-events-none absolute inset-x-0 bottom-4 flex flex-col items-center gap-2 px-4">
+   644→        <button
+   645→          type="button"
+   646→          onClick={scrollToAiPanel}
+   647→          className="pointer-events-auto flex min-h-10 items-center gap-2 rounded-full border border-white/15 bg-white/10 px-4 py-2 text-xs font-medium text-white backdrop-blur-md transition hover:bg-white/20"
+   648→        >
+   649→          <Bot className="size-4" aria-hidden />
+   650→          AI Play — copy state, paste moves
+   651→          <ChevronDown className="size-4" aria-hidden />
+   652→        </button>
+   653→        <p className="text-[10px] text-white/35 sm:text-[11px]">
+   654→          Drag a face to twist · drag the background to orbit · scroll to zoom
+   655→        </p>
+   656→      </div>
+   657→
+   658→      {/* WebGL unavailable */}
+   659→      {error && (
+   660→        <div className="absolute inset-0 grid place-items-center p-6">
+   661→          <div className="max-w-sm rounded-2xl border border-red-500/30 bg-black/70 p-6 text-center backdrop-blur-md">
+   662→            <p className="text-sm font-semibold text-red-300">
+   663→              3D rendering unavailable
+   664→            </p>
+   665→            <p className="mt-2 text-xs leading-relaxed text-white/70">{error}</p>
+   666→          </div>
+   667→        </div>
+   668→      )}
+   669→
+   670→      </section>
+   671→
+   672→      {/* ============================ AI play area =========================== */}
+   673→      <AiPlayPanel
+   674→        facelets={facelets}
+   675→        moveCount={moves}
+   676→        isSolved={cubeSolved}
+   677→        busy={busy}
+   678→        runProgress={runProgress}
+   679→        onRunMoves={(panelMoves) => void executePastedMoves(panelMoves)}
+   680→      />
+   681→
+   682→      <footer className="mt-auto border-t border-white/5 py-6 text-center text-[11px] text-white/35">
+   683→        Vanilla Three.js · Next.js App Router · static-export ready
+   684→      </footer>
+   685→
+   686→      <Toaster position="top-center" richColors closeButton />
+   687→    </div>
+   688→  );
+   689→}
+   690→
