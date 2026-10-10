@@ -46,11 +46,20 @@
 import * as THREE from "three";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 
-/** One of the three principal axes of the lattice. */
-export type PrincipalAxisName = "x" | "y" | "z";
+import {
+  COLOR_LETTER_BY_INDEX,
+  type FaceColorIndex,
+  type FaceMoveLetter,
+  type PrincipalAxisName,
+} from "./cubeNotation";
 
-/** Index into {@link FACE_COLORS} (order matches +X, -X, +Y, -Y, +Z, -Z). */
-export type FaceColorIndex = 0 | 1 | 2 | 3 | 4 | 5;
+// Re-exported so consumers can keep importing these types from the logic
+// module (single import site for anything cube-related).
+export type {
+  FaceColorIndex,
+  FaceMoveLetter,
+  PrincipalAxisName,
+} from "./cubeNotation";
 
 /** A signed quarter-turn count. -1 = 90 deg clockwise, 2 = 180 deg, etc. */
 export type QuarterTurns = -2 | -1 | 0 | 1 | 2;
@@ -454,6 +463,77 @@ export class RubiksCubeLogic {
       }
     }
     return true;
+  }
+
+  /**
+   * Current cube state as a 54-character Kociemba facelet string:
+   * faces in order U R F D L B, 9 chars each, each face read row-major from
+   * its outside view. A solved cube yields
+   * "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB".
+   *
+   * Every sticker's cubie-local normal is rotated into world space (cubies
+   * are always axis-aligned between turns) to find which face it is on now;
+   * the cubie's grid coordinate then gives the row/column within that face.
+   */
+  public getFaceletString(): string {
+    const cells = new Array<string>(54).fill("?");
+    for (const cubie of this.cubies) {
+      for (const sticker of cubie.stickers) {
+        const worldNormal = snapToPrincipalAxis(
+          sticker.localNormal.clone().applyQuaternion(cubie.group.quaternion),
+        );
+        const face: FaceMoveLetter =
+          worldNormal.y > 0
+            ? "U"
+            : worldNormal.y < 0
+              ? "D"
+              : worldNormal.x > 0
+                ? "R"
+                : worldNormal.x < 0
+                  ? "L"
+                  : worldNormal.z > 0
+                    ? "F"
+                    : "B";
+
+        // Row/column of this facelet within its face, standard net layout:
+        // U viewed with B at top, D viewed with F at top, side faces viewed
+        // with U at top (L has F to its right, R has F to its left,
+        // B has R to its left).
+        const { x, y, z } = cubie.grid;
+        let rowIndex = 0;
+        let colIndex = 0;
+        switch (face) {
+          case "U":
+            rowIndex = z + 1;
+            colIndex = x + 1;
+            break;
+          case "D":
+            rowIndex = 1 - z;
+            colIndex = x + 1;
+            break;
+          case "R":
+            rowIndex = 1 - y;
+            colIndex = 1 - z;
+            break;
+          case "L":
+            rowIndex = 1 - y;
+            colIndex = z + 1;
+            break;
+          case "F":
+            rowIndex = 1 - y;
+            colIndex = x + 1;
+            break;
+          case "B":
+            rowIndex = 1 - y;
+            colIndex = 1 - x;
+            break;
+        }
+        const block = { U: 0, R: 1, F: 2, D: 3, L: 4, B: 5 }[face];
+        cells[block * 9 + rowIndex * 3 + colIndex] =
+          COLOR_LETTER_BY_INDEX[sticker.colorIndex];
+      }
+    }
+    return cells.join("");
   }
 
   /** Restore the pristine solved cube instantly (grid + transforms). */

@@ -33,11 +33,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { PartyPopper, RotateCcw, Shuffle } from "lucide-react";
+import { PartyPopper, RotateCcw, Shuffle, Bot, ChevronDown } from "lucide-react";
 import { toast } from "sonner";
 
+import AiPlayPanel from "@/components/AiPlayPanel";
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
+import { FACE_MOVE_AXIS, type ParsedMove } from "@/lib/cubeNotation";
 import {
   Cubie,
   HALF_PI,
@@ -58,6 +60,8 @@ const DRAG_QUARTER_DISTANCE = 2;
 const SNAP_DURATION_MS = 170;
 const SCRAMBLE_MOVES = 24;
 const SCRAMBLE_MOVE_MS = 115;
+/** Duration of one face turn executed from a pasted AI solution (watchable). */
+const RUN_MOVE_MS = 240;
 
 /* -------------------------------- types ---------------------------------- */
 
@@ -141,7 +145,14 @@ export default function RubiksCubeCanvas() {
 
   const [moves, setMoves] = useState(0);
   const [busy, setBusy] = useState(false);
-  const [solved, setSolved] = useState(false);
+  /** Actual solved-ness of the cube (drives the banner AND the AI panel). */
+  const [cubeSolved, setCubeSolved] = useState(true);
+  /** Live 54-char facelet state for the AI Play panel. */
+  const [facelets, setFacelets] = useState("");
+  /** Progress of a pasted-move run (AI Play panel button label). */
+  const [runProgress, setRunProgress] = useState<{ current: number; total: number } | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
@@ -161,6 +172,8 @@ export default function RubiksCubeCanvas() {
       );
       if (disposedRef.current) return;
       logic.releaseSlice(move.quarterTurns);
+      // Keep the AI Play panel in sync with the committed state.
+      setFacelets(logic.getFaceletString());
     },
     [],
   );
@@ -170,7 +183,7 @@ export default function RubiksCubeCanvas() {
     if (!logic || busyRef.current || logic.isSliceGrabbed) return;
     busyRef.current = true;
     setBusy(true);
-    setSolved(false);
+    setCubeSolved(false);
     scrambledRef.current = true;
     movesRef.current = 0;
     setMoves(0);
@@ -193,7 +206,61 @@ export default function RubiksCubeCanvas() {
     movesRef.current = 0;
     setMoves(0);
     scrambledRef.current = false;
-    setSolved(false);
+    setCubeSolved(true);
+    setFacelets(logic.getFaceletString());
+  }, []);
+
+  /** Execute moves parsed from a pasted AI reply (AI Play panel, step 2). */
+  const executePastedMoves = useCallback(
+    async (movesToRun: ParsedMove[]) => {
+      const logic = logicRef.current;
+      if (!logic || busyRef.current || logic.isSliceGrabbed) {
+        toast.warning("The cube is busy", {
+          description: "Wait for the current animation to finish, then try again.",
+        });
+        return;
+      }
+      busyRef.current = true;
+      setBusy(true);
+      // Scroll back up so the user can watch the solution unfold live.
+      document
+        .getElementById("cube-section")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+      const total = movesToRun.length;
+      for (let index = 0; index < total; index += 1) {
+        const move = movesToRun[index];
+        setRunProgress({ current: index + 1, total });
+        const { axis, layer } = FACE_MOVE_AXIS[move.letter];
+        await animateMove(
+          { axis, layer, quarterTurns: move.quarterTurns },
+          RUN_MOVE_MS,
+        );
+        if (disposedRef.current) return;
+        const nextMoves = movesRef.current + Math.abs(move.quarterTurns);
+        movesRef.current = nextMoves;
+        setMoves(nextMoves);
+      }
+      setRunProgress(null);
+      busyRef.current = false;
+      setBusy(false);
+
+      const nowSolved = logic.isSolved();
+      setCubeSolved(nowSolved);
+      if (nowSolved && scrambledRef.current) {
+        scrambledRef.current = false;
+        toast.success(`Cube solved in ${movesRef.current} moves!`, {
+          description: "The pasted moves did it — scramble again for another round.",
+        });
+      } else {
+        toast.success(`Executed ${total} move${total === 1 ? "" : "s"}.`);
+      }
+    },
+    [animateMove],
+  );
+
+  const scrollToAiPanel = useCallback(() => {
+    document.getElementById("ai-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
 
   useEffect(() => {
@@ -412,9 +479,10 @@ export default function RubiksCubeCanvas() {
         const nextMoves = movesRef.current + Math.abs(snappedTurns);
         movesRef.current = nextMoves;
         setMoves(nextMoves);
+        setFacelets(logic.getFaceletString());
 
         const nowSolved = logic.isSolved();
-        setSolved(nowSolved);
+        setCubeSolved(nowSolved);
         if (nowSolved && scrambledRef.current) {
           scrambledRef.current = false;
           toast.success(`Cube solved in ${nextMoves} moves!`, {
@@ -472,7 +540,10 @@ export default function RubiksCubeCanvas() {
     frameId = requestAnimationFrame(tick);
     // Fade the canvas in once rendering has actually started (async callback,
     // so React never gets a synchronous setState from the effect body).
-    requestAnimationFrame(() => setReady(true));
+    requestAnimationFrame(() => {
+      setReady(true);
+      setFacelets(logic.getFaceletString());
+    });
 
     /* ----------------------- strict cleanup --------------------- */
     return () => {
@@ -499,7 +570,12 @@ export default function RubiksCubeCanvas() {
   /* --------------------------- HUD ---------------------------- */
 
   return (
-    <div className="relative h-dvh w-full overflow-hidden bg-neutral-950 bg-[radial-gradient(ellipse_at_center,#1d2233_0%,#0b0d13_58%,#05060a_100%)]">
+    <div className="flex min-h-dvh w-full flex-col bg-neutral-950 text-white">
+      {/* ============================== 3D cube ============================== */}
+      <section
+        id="cube-section"
+        className="relative h-dvh w-full overflow-hidden bg-[radial-gradient(ellipse_at_center,#1d2233_0%,#0b0d13_58%,#05060a_100%)]"
+      >
       {/* Three.js mounts its <canvas> into this div */}
       <div
         ref={containerRef}
@@ -554,7 +630,7 @@ export default function RubiksCubeCanvas() {
       </div>
 
       {/* Solved celebration */}
-      {solved && (
+      {cubeSolved && moves > 0 && (
         <div className="pointer-events-none absolute inset-x-0 top-24 flex justify-center px-4">
           <div className="flex items-center gap-2 rounded-full bg-emerald-500/90 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-500/25">
             <PartyPopper className="size-4" aria-hidden />
@@ -562,6 +638,22 @@ export default function RubiksCubeCanvas() {
           </div>
         </div>
       )}
+
+      {/* AI Play shortcut + interaction hints */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-4 flex flex-col items-center gap-2 px-4">
+        <button
+          type="button"
+          onClick={scrollToAiPanel}
+          className="pointer-events-auto flex min-h-10 items-center gap-2 rounded-full border border-white/15 bg-white/10 px-4 py-2 text-xs font-medium text-white backdrop-blur-md transition hover:bg-white/20"
+        >
+          <Bot className="size-4" aria-hidden />
+          AI Play — copy state, paste moves
+          <ChevronDown className="size-4" aria-hidden />
+        </button>
+        <p className="text-[10px] text-white/35 sm:text-[11px]">
+          Drag a face to twist · drag the background to orbit · scroll to zoom
+        </p>
+      </div>
 
       {/* WebGL unavailable */}
       {error && (
@@ -574,6 +666,22 @@ export default function RubiksCubeCanvas() {
           </div>
         </div>
       )}
+
+      </section>
+
+      {/* ============================ AI play area =========================== */}
+      <AiPlayPanel
+        facelets={facelets}
+        moveCount={moves}
+        isSolved={cubeSolved}
+        busy={busy}
+        runProgress={runProgress}
+        onRunMoves={(panelMoves) => void executePastedMoves(panelMoves)}
+      />
+
+      <footer className="mt-auto border-t border-white/5 py-6 text-center text-[11px] text-white/35">
+        Vanilla Three.js · Next.js App Router · static-export ready
+      </footer>
 
       <Toaster position="top-center" richColors closeButton />
     </div>
