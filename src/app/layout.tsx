@@ -24,6 +24,8 @@ export const metadata: Metadata = {
     "Rubik's Cube",
     "Clover Pyramid",
     "jumbling puzzle",
+    "Photo Jigsaw",
+    "jigsaw puzzle",
   ],
   authors: [{ name: "Twisty Lab" }],
   icons: {

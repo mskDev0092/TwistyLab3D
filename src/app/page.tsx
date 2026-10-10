@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { ArrowRight, Box, Pyramid, Sparkles } from "lucide-react";
+import { ArrowRight, Box, Image as ImageIcon, Pyramid, Sparkles } from "lucide-react";
 
 export const metadata: Metadata = {
   title: "Twisty Lab · 3D twisty puzzle studio",
@@ -55,6 +55,18 @@ const games: Game[] = [
     ring: "group-hover:ring-fuchsia-400/50",
     chip: "bg-fuchsia-500/15 text-fuchsia-300",
   },
+  {
+    href: "/image-puzzle",
+    name: "Photo Jigsaw",
+    tagline: "Any picture, scrambled",
+    blurb:
+      "Turn any photo into a sliding board puzzle. Pick a sample or drop your own image, then drag the scrambled tiles back into place to rebuild it.",
+    level: "Relaxing",
+    Icon: ImageIcon,
+    accent: "from-amber-400 to-rose-500",
+    ring: "group-hover:ring-amber-400/50",
+    chip: "bg-amber-400/15 text-amber-300",
+  },
 ];
 
 export default function HomePage() {
@@ -70,7 +82,7 @@ export default function HomePage() {
         className="pointer-events-none absolute inset-0 opacity-[0.04] [background-image:linear-gradient(to_right,#fff_1px,transparent_1px),linear-gradient(to_bottom,#fff_1px,transparent_1px)] [background-size:44px_44px]"
       />
 
-      <div className="relative z-10 mx-auto flex w-full max-w-4xl flex-1 flex-col px-6 py-14 sm:py-20">
+      <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 py-14 sm:py-20">
         {/* Masthead */}
         <header className="flex flex-col items-center text-center">
           <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.28em] text-white/60 backdrop-blur">
@@ -86,7 +98,7 @@ export default function HomePage() {
         </header>
 
         {/* Game cards */}
-        <div className="mt-12 grid gap-5 sm:grid-cols-2 sm:mt-14">
+        <div className="mt-12 grid gap-5 sm:grid-cols-2 sm:mt-14 lg:grid-cols-3">
           {games.map((game) => (
             <Link
               key={game.href}
